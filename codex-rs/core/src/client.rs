@@ -1,0 +1,5935 @@
+//! Session- and turn-scoped helpers for talking to model provider APIs.
+//!
+//! `ModelClient` is intended to live for the lifetime of a Codex session and holds the stable
+//! configuration and state needed to talk to a provider (auth, provider selection, conversation id,
+//! and transport fallback state).
+//!
+//! Per-turn settings (model selection, reasoning controls, telemetry context, and turn metadata)
+//! are passed explicitly to streaming and unary methods so that the turn lifetime is visible at the
+//! call site.
+//!
+//! A [`ModelClientSession`] is created per turn and is used to stream one or more Responses API
+//! requests during that turn. It caches a Responses WebSocket connection (opened lazily) and stores
+//! per-turn state such as the `x-codex-turn-state` token used for sticky routing.
+//! Cached connections, incremental response state, and turn routing are discarded when auth
+//! ownership changes.
+//!
+//! WebSocket prewarm is a v2-only `response.create` with `generate=false`; it waits for completion
+//! so the next request can reuse the same connection and `previous_response_id`.
+//!
+//! Turn execution performs prewarm as a best-effort step before the first stream request so the
+//! subsequent request can reuse the same connection.
+//!
+//! ## Retry-Budget Tradeoff
+//!
+//! WebSocket prewarm is treated as the first websocket connection attempt for a turn. If it
+//! fails, normal stream retry/fallback logic handles recovery on the same turn.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
+#[path = "client_tool_metadata.rs"]
+mod tool_metadata;
+
+use crate::CodexResponsesHeaders;
+use crate::tools::ExecutedToolCalls;
+use async_channel::Sender;
+use codex_api::AgentIdentityTelemetry;
+use codex_api::AnthropicClient as ApiAnthropicClient;
+use codex_api::ApiError;
+use codex_api::AuthProvider;
+use codex_api::ChatCompletionsClient as ApiChatCompletionsClient;
+use codex_api::ChatCompletionsRequest;
+use codex_api::ChatMessage;
+use codex_api::Compression;
+use codex_api::MemoriesClient as ApiMemoriesClient;
+use codex_api::MemorySummarizeInput as ApiMemorySummarizeInput;
+use codex_api::MemorySummarizeOutput as ApiMemorySummarizeOutput;
+use codex_api::Provider as ApiProvider;
+use codex_api::RawMemory as ApiRawMemory;
+use codex_api::RealtimeCallClient as ApiRealtimeCallClient;
+use codex_api::RealtimeSessionConfig as ApiRealtimeSessionConfig;
+use codex_api::Reasoning;
+use codex_api::ReasoningContext;
+use codex_api::RequestTelemetry;
+use codex_api::ReqwestTransport;
+use codex_api::ResponseCreateWsRequest;
+use codex_api::ResponsesApiRequest;
+use codex_api::ResponsesClient as ApiResponsesClient;
+use codex_api::ResponsesOptions as ApiResponsesOptions;
+use codex_api::ResponsesWebsocketClient as ApiWebSocketResponsesClient;
+use codex_api::ResponsesWebsocketConnection as ApiWebSocketConnection;
+use codex_api::ResponsesWsRequest;
+use codex_api::SharedAuthProvider;
+use codex_api::SseTelemetry;
+use codex_api::StreamOptions;
+use codex_api::TransportError;
+use codex_api::WebsocketTelemetry;
+use codex_api::auth_header_telemetry;
+use codex_api::build_session_headers;
+use codex_api::create_text_param_for_request;
+use codex_api::response_create_client_metadata;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
+use codex_login::AuthManager;
+use codex_login::CodexAuth;
+use codex_login::RefreshTokenError;
+use codex_login::UnauthorizedRecovery;
+use codex_login::default_client::ClientRedirectPolicy;
+use codex_login::default_client::add_originator_header;
+use codex_login::default_client::create_client_for_route;
+use codex_otel::SessionTelemetry;
+use codex_otel::WEBSOCKET_CONTINUATION_COUNT_METRIC;
+use codex_otel::current_span_w3c_trace_context;
+use codex_protocol::ResponseItemId;
+use codex_protocol::auth::AuthMode;
+
+use codex_protocol::ThreadId;
+use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+use codex_protocol::config_types::Verbosity as VerbosityConfig;
+use codex_protocol::models::AgentMessageInputContent;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::protocol::AuthRecoveryEvent;
+use codex_protocol::protocol::Event as ProtocolEvent;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::InternalSessionSource;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::W3cTraceContext;
+use codex_rollout_trace::InferenceTraceAttempt;
+use codex_rollout_trace::InferenceTraceContext;
+use codex_tools::ResponsesApiNamespaceTool;
+use codex_tools::ToolSpec;
+use codex_tools::create_tools_json_for_chat_completions;
+use codex_tools::create_tools_json_for_responses_api;
+use codex_tools::create_tools_json_for_responses_lite;
+use codex_tools::create_tools_raw_json_for_responses_api;
+use eventsource_stream::Event;
+use eventsource_stream::EventStreamError;
+use futures::StreamExt;
+use http::HeaderMap as ApiHeaderMap;
+use http::HeaderValue;
+use http::StatusCode;
+use std::time::Duration;
+use std::time::Instant;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::error::TryRecvError;
+use tokio::time::sleep;
+use tokio_tungstenite::tungstenite::Error;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_util::sync::CancellationToken;
+use tracing::instrument;
+use tracing::trace;
+use tracing::warn;
+use uuid::Uuid;
+
+use crate::attestation::AttestationContext;
+use crate::attestation::AttestationProvider;
+use crate::attestation::X_OAI_ATTESTATION_HEADER;
+use crate::client_common::Prompt;
+use crate::client_common::ResponseEvent;
+use crate::client_common::ResponseStream;
+use crate::context::BaseInstructionsFragment;
+use crate::context::ContextualUserFragment;
+use crate::cyber_access_program;
+use crate::feedback_tags;
+use crate::responses_metadata::CodexResponsesMetadata;
+use crate::responses_metadata::subagent_header_value;
+use crate::util::emit_feedback_auth_recovery_tags;
+use codex_feedback::FeedbackRequestTags;
+use codex_feedback::emit_feedback_request_tags_with_auth_env;
+use codex_login::auth::AgentIdentityAuthPolicy;
+use codex_login::auth_env_telemetry::AuthEnvTelemetry;
+use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
+use codex_model_provider::AgentIdentitySessionFallback;
+use codex_model_provider::ProviderAuthScope;
+use codex_model_provider::ProviderUnauthorizedRecovery;
+use codex_model_provider::ResponsesConnectionKey;
+use codex_model_provider::SharedModelProvider;
+use codex_model_provider::WorkspaceRoutingContext;
+use codex_model_provider::create_model_provider;
+#[cfg(test)]
+use codex_model_provider_info::DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS;
+use codex_model_provider_info::ModelProviderInfo;
+use codex_model_provider_info::WireApi;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result;
+use codex_response_debug_context::extract_response_debug_context;
+use codex_response_debug_context::extract_response_debug_context_from_api_error;
+use codex_response_debug_context::telemetry_api_error_message;
+use codex_response_debug_context::telemetry_transport_error_message;
+
+pub const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
+pub const X_CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
+pub const X_CODEX_ROUTING_HINT_HEADER: &str = "x-codex-routing-hint";
+pub const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
+pub const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
+pub const X_CODEX_PARENT_THREAD_ID_HEADER: &str = "x-codex-parent-thread-id";
+pub const X_CODEX_WINDOW_ID_HEADER: &str = "x-codex-window-id";
+pub const X_OPENAI_MEMGEN_REQUEST_HEADER: &str = "x-openai-memgen-request";
+pub const X_OPENAI_SUBAGENT_HEADER: &str = "x-openai-subagent";
+pub const X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER: &str =
+    "x-responsesapi-include-timing-metrics";
+const X_SESSION_AFFINITY_HEADER: &str = "x-session-affinity";
+const X_SESSION_ID_HEADER: &str = "X-Session-Id";
+const X_PARENT_SESSION_ID_HEADER: &str = "x-parent-session-id";
+const X_CODEX_WS_STREAM_REQUEST_START_MS_CLIENT_METADATA_KEY: &str =
+    "x-codex-ws-stream-request-start-ms";
+const WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY: &str =
+    "ws_request_header_x_openai_internal_codex_responses_lite";
+const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
+const X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER: &str =
+    "x-openai-internal-codex-responses-lite";
+const REALTIME_CALLS_ENDPOINT: &str = "/realtime/calls";
+const MEMORIES_SUMMARIZE_ENDPOINT: &str = "/memories/trace_summarize";
+#[cfg(test)]
+pub(crate) const WEBSOCKET_CONNECT_TIMEOUT: Duration =
+    Duration::from_millis(DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS);
+
+fn session_telemetry_for_request(
+    session_telemetry: &SessionTelemetry,
+    request: &ResponsesApiRequest,
+) -> SessionTelemetry {
+    session_telemetry.clone().with_inference_request(
+        request.service_tier.as_deref(),
+        request
+            .reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.effort.as_ref()),
+    )
+}
+
+/// Session-scoped state shared by all [`ModelClient`] clones.
+///
+/// This is intentionally kept minimal so `ModelClient` does not need to hold a full `Config`. Most
+/// configuration is per turn and is passed explicitly to streaming/unary methods.
+#[derive(Debug)]
+struct ModelClientState {
+    thread_id: ThreadId,
+    provider: SharedModelProvider,
+    workspace_routing: WorkspaceRoutingContext,
+    auth_env_telemetry: AuthEnvTelemetry,
+    session_source: SessionSource,
+    originator: String,
+    model_verbosity: Option<VerbosityConfig>,
+    content_item_kinds_enabled: bool,
+    reasoning_effort_override_enabled: bool,
+    enable_request_compression: bool,
+    include_timing_metrics: bool,
+    beta_features_header: Option<String>,
+    concurrent_reasoning_summaries_enabled: bool,
+    include_attestation: bool,
+    attestation_provider: Option<Arc<dyn AttestationProvider>>,
+    disable_websockets: AtomicBool,
+    agent_identity_session_fallback: AgentIdentitySessionFallback,
+    cached_websocket_session: StdMutex<WebsocketSession>,
+}
+
+enum ClientRouting {
+    Workspace,
+    ConfiguredProvider,
+}
+
+/// Resolved API client setup for a single request attempt.
+///
+/// Keeping this as a single bundle ensures prewarm and normal request paths
+/// share the same auth/provider setup flow.
+struct CurrentClientSetup {
+    auth: Option<CodexAuth>,
+    auth_owner_generation: Option<u64>,
+    auth_revision: Option<u64>,
+    api_provider: ApiProvider,
+    redirect_policy: ClientRedirectPolicy,
+    api_auth: SharedAuthProvider,
+    agent_identity_telemetry: Option<AgentIdentityTelemetry>,
+}
+
+#[derive(Clone, Copy)]
+struct RequestRouteTelemetry {
+    endpoint: &'static str,
+}
+
+impl RequestRouteTelemetry {
+    fn for_endpoint(endpoint: &'static str) -> Self {
+        Self { endpoint }
+    }
+}
+
+/// A session-scoped client for model-provider API calls.
+///
+/// This holds configuration and state that should be shared across turns within a Codex session
+/// (auth, provider selection, thread id, and transport fallback state).
+///
+/// WebSocket fallback is session-scoped: once a turn activates the HTTP fallback, subsequent turns
+/// will also use HTTP for the remainder of the session.
+///
+/// Turn-scoped settings (model selection, reasoning controls, telemetry context, and turn
+/// metadata) are passed explicitly to the relevant methods to keep turn lifetime visible at the
+/// call site.
+#[derive(Debug, Clone)]
+pub struct ModelClient {
+    state: Arc<ModelClientState>,
+    agent_identity_policy: AgentIdentityAuthPolicy,
+    prompt_cache_key_override: Option<String>,
+    codex_responses_headers: Option<Arc<CodexResponsesHeaders>>,
+    event_sender: Option<Sender<ProtocolEvent>>,
+    http_client_factory: HttpClientFactory,
+    restored_history: bool,
+    request_contributors: Vec<Arc<dyn codex_extension_api::ModelRequestContributor>>,
+    executed_tool_calls: Option<ExecutedToolCalls>,
+}
+
+/// A turn-scoped streaming session created from a [`ModelClient`].
+///
+/// The session establishes a Responses WebSocket connection lazily and reuses it across multiple
+/// requests within the turn. It also caches per-turn state:
+///
+/// - The last full request, so subsequent calls can reuse incremental websocket request payloads
+///   only when the current request is an incremental extension of the previous one.
+/// - The `x-codex-turn-state` sticky-routing token, which must be replayed for all requests within
+///   the same turn.
+///
+/// Create a fresh `ModelClientSession` for each Codex turn. Reusing it across turns would replay
+/// the previous turn's sticky-routing token into the next turn, which violates the client/server
+/// contract and can cause routing bugs.
+/// Callback invoked when a Chat Completions or Anthropic streaming request
+/// retries after a transient error. Used to surface retry progress (attempt
+/// number and error code) to the UI so the user understands the request is
+/// being retried rather than frozen.
+///
+/// Implementations are expected to be cheap and non-blocking; the retry loop
+/// fires the callback synchronously without awaiting it.
+pub(crate) trait StreamErrorNotifier: Send + Sync {
+    /// Fired when Chat Completions / Anthropic streaming retries.
+    ///
+    /// - `message`: human-readable retry line, e.g. "Retrying... (attempt 2) — HTTP 429".
+    /// - `additional_details`: rendering of the underlying error (its `Display` form).
+    /// - `http_status_code`: HTTP status code carried by the error, if any.
+    fn notify(&self, message: String, additional_details: String, http_status_code: Option<u16>);
+}
+
+/// Builds a short human-readable error code suffix from an `ApiError`, e.g.
+/// `HTTP 429`, `HTTP 502`, `connection timeout`, `network error`. Used by
+/// the Chat Completions / Anthropic retry notifications.
+fn api_error_code(err: &ApiError) -> String {
+    match err {
+        ApiError::Transport(TransportError::Http { status, .. }) => {
+            format!("HTTP {status}")
+        }
+        ApiError::Transport(TransportError::Timeout) => "connection timeout".to_string(),
+        ApiError::Transport(TransportError::Connection(_)) => "connection failed".to_string(),
+        ApiError::Transport(TransportError::Network(_)) => "network error".to_string(),
+        ApiError::Transport(TransportError::Build(_)) => "request build error".to_string(),
+        ApiError::Transport(TransportError::Policy(_)) => "transport policy".to_string(),
+        ApiError::Transport(TransportError::RetryLimit) => "retry limit".to_string(),
+        ApiError::Transport(TransportError::ResponseTooLarge { .. }) => {
+            "response too large".to_string()
+        }
+        ApiError::Api { status, .. } => format!("HTTP {status}"),
+        ApiError::Stream(_) => "stream error".to_string(),
+        ApiError::ContextWindowExceeded => "context window exceeded".to_string(),
+        ApiError::QuotaExceeded => "HTTP 429 quota exceeded".to_string(),
+        ApiError::UsageNotIncluded => "usage not included".to_string(),
+        ApiError::Retryable { .. } => "transient error".to_string(),
+        ApiError::RateLimit(_) => "HTTP 429 rate limit".to_string(),
+        ApiError::InvalidRequest { .. } => "invalid request".to_string(),
+        ApiError::InvalidPrompt { .. } => "invalid prompt".to_string(),
+        ApiError::CyberPolicy { .. } => "cyber policy".to_string(),
+        ApiError::MisalignmentPolicyViolation { .. } => "misalignment policy violation".to_string(),
+        ApiError::BioPolicy { .. } => "bio policy violation".to_string(),
+        ApiError::FlexUnavailable => "flex capacity unavailable".to_string(),
+        ApiError::ServerOverloaded { .. } => "HTTP 529 server overloaded".to_string(),
+        ApiError::RateLimitExceeded { .. } => "HTTP 429 rate limit exceeded".to_string(),
+        ApiError::ContentFilter => "content filter".to_string(),
+    }
+}
+
+pub struct ModelClientSession {
+    client: ModelClient,
+    websocket_session: WebsocketSession,
+    /// Optional notifier invoked when Chat Completions / Anthropic streaming
+    /// retries after a transient error. `None` for paths that already have
+    /// their own retry notifications (e.g. Responses via `turn.rs`).
+    stream_error_notifier: Option<Arc<dyn StreamErrorNotifier>>,
+    /// Turn state for sticky routing.
+    ///
+    /// This is an `OnceLock` that stores the turn state value received from the server
+    /// on turn start via the `x-codex-turn-state` response header. Once set, this value
+    /// should be sent back to the server in the `x-codex-turn-state` request header for
+    /// all subsequent requests within the same turn to maintain sticky routing.
+    ///
+    /// This is a contract between the client and server: we receive it at turn start,
+    /// keep sending it unchanged between turn requests (e.g., for retries, incremental
+    /// appends, or continuation requests), and must not send it between different turns.
+    /// An auth ownership change clears it so the new owner gets fresh routing state.
+    turn_state: Arc<OnceLock<String>>,
+}
+
+#[derive(Debug, Clone)]
+struct LastResponse {
+    response_id: String,
+    items_added: Vec<ResponseItem>,
+}
+
+struct WebsocketContinuation {
+    response_id: String,
+    items: Vec<ResponseItem>,
+    from_untraced_warmup: bool,
+}
+
+#[derive(Debug, Default)]
+struct WebsocketSession {
+    connection: Option<ApiWebSocketConnection>,
+    responses_headers: ApiHeaderMap,
+    /// Owner of the cached state, including before a connection is opened.
+    auth_owner_generation: Option<u64>,
+    connection_key: Option<ResponsesConnectionKey>,
+    last_request: Option<ResponsesApiRequest>,
+    last_response_rx: Option<oneshot::Receiver<LastResponse>>,
+    last_response_from_untraced_warmup: bool,
+    connection_reused: StdMutex<bool>,
+    continuation_reset_reason: Option<&'static str>,
+}
+
+// This is intentionally not a `PartialEq` implementation: request equality includes `input` and
+// `client_metadata`, while websocket reuse compares input and late tool-result metadata separately.
+// Access programs are authorized per response, including continuations, without replaying input.
+// Keep the destructuring exhaustive so new request fields require an explicit reuse decision.
+fn responses_request_properties_match(
+    previous: &ResponsesApiRequest,
+    current: &ResponsesApiRequest,
+) -> bool {
+    let ResponsesApiRequest {
+        model: previous_model,
+        instructions: previous_instructions,
+        input: _,
+        tools: previous_tools,
+        tool_choice: previous_tool_choice,
+        parallel_tool_calls: previous_parallel_tool_calls,
+        reasoning: previous_reasoning,
+        store: previous_store,
+        stream: previous_stream,
+        stream_options: _,
+        include: previous_include,
+        service_tier: previous_service_tier,
+        prompt_cache_key: previous_prompt_cache_key,
+        text: previous_text,
+        client_metadata: _,
+        access_programs: _,
+    } = previous;
+    let ResponsesApiRequest {
+        model: current_model,
+        instructions: current_instructions,
+        input: _,
+        tools: current_tools,
+        tool_choice: current_tool_choice,
+        parallel_tool_calls: current_parallel_tool_calls,
+        reasoning: current_reasoning,
+        store: current_store,
+        stream: current_stream,
+        stream_options: _,
+        include: current_include,
+        service_tier: current_service_tier,
+        prompt_cache_key: current_prompt_cache_key,
+        text: current_text,
+        client_metadata: _,
+        access_programs: _,
+    } = current;
+
+    previous_model == current_model
+        && previous_instructions == current_instructions
+        && previous_tools == current_tools
+        && previous_tool_choice == current_tool_choice
+        && previous_parallel_tool_calls == current_parallel_tool_calls
+        && previous_reasoning == current_reasoning
+        && previous_store == current_store
+        && previous_stream == current_stream
+        // Stream options control delivery for this response, not the context
+        // referenced by `previous_response_id`.
+        && previous_include == current_include
+        && previous_service_tier == current_service_tier
+        && previous_prompt_cache_key == current_prompt_cache_key
+        && previous_text == current_text
+}
+
+fn response_items_equal_ignoring_internal_metadata(
+    previous: &ResponseItem,
+    current: &ResponseItem,
+) -> bool {
+    if previous == current {
+        return true;
+    }
+
+    // Late results update an already-sent output. A delta cannot carry that update.
+    if !previous.has_same_tool_result_metadata(current) {
+        return false;
+    }
+
+    let mut previous = previous.clone();
+    previous.clear_internal_chat_message_metadata_passthrough();
+    let mut current = current.clone();
+    current.clear_internal_chat_message_metadata_passthrough();
+    previous == current
+}
+
+impl WebsocketSession {
+    fn reset(&mut self, reason: Option<&'static str>) {
+        // Per-socket backend metrics call a resend after reconnect "initial".
+        // Retain the loss reason across reconnects/turns until the next send.
+        let continuation_reset_reason = self
+            .continuation_reset_reason
+            .or_else(|| self.last_request.as_ref().and(reason));
+        *self = Self {
+            auth_owner_generation: self.auth_owner_generation,
+            continuation_reset_reason,
+            ..Default::default()
+        };
+    }
+
+    fn set_connection_reused(&self, connection_reused: bool) {
+        *self
+            .connection_reused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = connection_reused;
+    }
+
+    fn connection_reused(&self) -> bool {
+        *self
+            .connection_reused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+enum WebsocketStreamOutcome {
+    Stream(ResponseStream),
+    FallbackToHttp,
+}
+
+/// Result of opening a WebRTC Realtime call.
+///
+/// The SDP answer goes back to the client. The call id and auth headers stay on the server so the
+/// ordinary Realtime WebSocket machinery can join the same in-progress call as a sideband
+/// controller.
+pub(crate) struct RealtimeWebrtcCallStart {
+    pub(crate) sdp: String,
+    pub(crate) call_id: String,
+    pub(crate) sideband_headers: ApiHeaderMap,
+}
+
+/// Reuses the API-auth material that created the WebRTC call for the sideband WebSocket join.
+///
+/// API-key sessions send that API bearer. ChatGPT-auth sessions send their bearer plus account id;
+/// transceiver is responsible for accepting that same call-create identity on the direct
+/// `api.openai.com` sideband path.
+fn sideband_websocket_auth_headers(api_auth: &dyn AuthProvider) -> ApiHeaderMap {
+    let mut headers = ApiHeaderMap::new();
+    api_auth.add_auth_headers(&mut headers);
+    headers
+}
+
+impl ModelClient {
+    #[allow(clippy::too_many_arguments)]
+    /// Creates a new session-scoped `ModelClient`.
+    ///
+    /// All arguments are expected to be stable for the lifetime of a Codex session. Per-turn values
+    /// are passed to [`ModelClientSession::stream`] (and other turn-scoped methods) explicitly. The
+    /// HTTP client factory must come from the effective session configuration so every transport
+    /// observes the resolved outbound proxy policy.
+    pub fn new(
+        auth_manager: Option<Arc<AuthManager>>,
+        agent_identity_policy: AgentIdentityAuthPolicy,
+        thread_id: ThreadId,
+        provider_info: ModelProviderInfo,
+        session_source: SessionSource,
+        originator: String,
+        model_verbosity: Option<VerbosityConfig>,
+        content_item_kinds_enabled: bool,
+        reasoning_effort_override_enabled: bool,
+        enable_request_compression: bool,
+        include_timing_metrics: bool,
+        beta_features_header: Option<String>,
+        concurrent_reasoning_summaries_enabled: bool,
+        attestation_provider: Option<Arc<dyn AttestationProvider>>,
+        http_client_factory: HttpClientFactory,
+        workspace_routing: WorkspaceRoutingContext,
+        request_contributors: Vec<Arc<dyn codex_extension_api::ModelRequestContributor>>,
+    ) -> Self {
+        let model_provider = create_model_provider(provider_info, auth_manager);
+        let codex_api_key_env_enabled = model_provider
+            .auth_manager()
+            .as_ref()
+            .is_some_and(|manager| manager.codex_api_key_env_enabled());
+        let auth_env_telemetry =
+            collect_auth_env_telemetry(model_provider.info(), codex_api_key_env_enabled);
+        let include_attestation = model_provider.supports_attestation();
+        // Fixed-effort workers use request-level effort even when managed requirements
+        // pin the feature on. Share this decision with update injection and pinning.
+        let memory_consolidation = matches!(
+            &session_source,
+            SessionSource::Internal(InternalSessionSource::MemoryConsolidation)
+                | SessionSource::SubAgent(SubAgentSource::MemoryConsolidation)
+        );
+        let reasoning_effort_override_enabled = reasoning_effort_override_enabled
+            && !crate::guardian::is_basic_session_source(&session_source)
+            && !memory_consolidation;
+        Self {
+            state: Arc::new(ModelClientState {
+                thread_id,
+                provider: model_provider,
+                workspace_routing,
+                auth_env_telemetry,
+                session_source,
+                originator,
+                model_verbosity,
+                content_item_kinds_enabled,
+                reasoning_effort_override_enabled,
+                enable_request_compression,
+                include_timing_metrics,
+                beta_features_header,
+                concurrent_reasoning_summaries_enabled,
+                include_attestation,
+                attestation_provider,
+                disable_websockets: AtomicBool::new(false),
+                agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
+                cached_websocket_session: StdMutex::new(WebsocketSession::default()),
+            }),
+            agent_identity_policy,
+            prompt_cache_key_override: None,
+            codex_responses_headers: None,
+            event_sender: None,
+            http_client_factory,
+            restored_history: false,
+            request_contributors,
+            executed_tool_calls: None,
+        }
+    }
+
+    pub(crate) fn with_executed_tool_calls(mut self, recorder: ExecutedToolCalls) -> Self {
+        self.executed_tool_calls = Some(recorder);
+        self
+    }
+
+    pub(crate) fn reasoning_effort_override_enabled(&self, model_info: &ModelInfo) -> bool {
+        self.state.reasoning_effort_override_enabled
+            && self.state.provider.info().is_openai()
+            && model_info.supports_reasoning_effort_updates
+    }
+
+    pub(crate) fn with_restored_history(mut self, restored_history: bool) -> Self {
+        self.restored_history = restored_history;
+        self
+    }
+
+    pub(crate) fn with_session_context(
+        mut self,
+        prompt_cache_key_override: Option<String>,
+        event_sender: Sender<ProtocolEvent>,
+        codex_responses_headers: Option<Arc<CodexResponsesHeaders>>,
+    ) -> Self {
+        self.prompt_cache_key_override = prompt_cache_key_override;
+        self.event_sender = Some(event_sender);
+        self.codex_responses_headers = codex_responses_headers;
+        self
+    }
+
+    fn prompt_cache_key(&self, responses_metadata: &CodexResponsesMetadata) -> String {
+        if let Some(prompt_cache_key) = &self.prompt_cache_key_override {
+            return prompt_cache_key.clone();
+        }
+
+        if let SessionSource::Internal(source) = &self.state.session_source
+            && let Some(parent_thread_id) = responses_metadata.parent_thread_id
+        {
+            return format!("{source}:{parent_thread_id}");
+        }
+
+        responses_metadata.session_id.clone()
+    }
+
+    // ChatGPT derives cache affinity from the Responses session-id header. Keep the
+    // actual session identity in turn metadata, hooks, and history/notes requests.
+    fn responses_session_id(&self, metadata: &CodexResponsesMetadata) -> String {
+        if self.state.session_source.is_non_root_agent() {
+            metadata.session_id.clone()
+        } else {
+            self.prompt_cache_key(metadata)
+        }
+    }
+
+    /// Creates a fresh turn-scoped streaming session.
+    ///
+    /// This constructor does not perform network I/O itself; the session opens a websocket lazily
+    /// when the first stream request is issued.
+    pub fn new_session(&self) -> ModelClientSession {
+        let auth_owner_generation = self.auth_owner_generation();
+        let mut websocket_session = self.take_cached_websocket_session();
+        if websocket_session.auth_owner_generation != auth_owner_generation {
+            // Drop the old owner's cache before this turn can establish fresh routing state.
+            websocket_session.reset(Some("other"));
+            websocket_session.auth_owner_generation = auth_owner_generation;
+        }
+        ModelClientSession {
+            client: self.clone(),
+            websocket_session,
+            turn_state: Arc::new(OnceLock::new()),
+            stream_error_notifier: None,
+        }
+    }
+
+    /// Creates a new `ModelClient` with the given provider replacing the
+    /// session-level provider. Derived fields (auth env telemetry, attestation
+    /// support, etc.) are recomputed from the new provider.
+    pub fn with_provider(&self, provider: SharedModelProvider) -> Self {
+        let codex_api_key_env_enabled = provider
+            .auth_manager()
+            .as_ref()
+            .is_some_and(|manager| manager.codex_api_key_env_enabled());
+        let auth_env_telemetry =
+            collect_auth_env_telemetry(provider.info(), codex_api_key_env_enabled);
+        let include_attestation = provider.supports_attestation();
+        Self {
+            state: Arc::new(ModelClientState {
+                thread_id: self.state.thread_id,
+                provider,
+                auth_env_telemetry,
+                session_source: self.state.session_source.clone(),
+                originator: self.state.originator.clone(),
+                model_verbosity: self.state.model_verbosity,
+                enable_request_compression: self.state.enable_request_compression,
+                include_timing_metrics: self.state.include_timing_metrics,
+                beta_features_header: self.state.beta_features_header.clone(),
+                concurrent_reasoning_summaries_enabled: self
+                    .state
+                    .concurrent_reasoning_summaries_enabled,
+                include_attestation,
+                attestation_provider: self.state.attestation_provider.clone(),
+                disable_websockets: AtomicBool::new(
+                    self.state.disable_websockets.load(Ordering::Relaxed),
+                ),
+                agent_identity_session_fallback: self.state.agent_identity_session_fallback.clone(),
+                cached_websocket_session: StdMutex::new(WebsocketSession::default()),
+                content_item_kinds_enabled: self.state.content_item_kinds_enabled,
+                workspace_routing: self.state.workspace_routing.clone(),
+                reasoning_effort_override_enabled: self.state.reasoning_effort_override_enabled,
+            }),
+            agent_identity_policy: self.agent_identity_policy,
+            prompt_cache_key_override: self.prompt_cache_key_override.clone(),
+            request_contributors: self.request_contributors.clone(),
+            executed_tool_calls: self.executed_tool_calls.clone(),
+            codex_responses_headers: self.codex_responses_headers.clone(),
+            event_sender: self.event_sender.clone(),
+            http_client_factory: self.http_client_factory.clone(),
+            restored_history: self.restored_history,
+        }
+    }
+
+    pub(crate) fn auth_manager(&self) -> Option<Arc<AuthManager>> {
+        self.state.provider.auth_manager()
+    }
+
+    fn auth_owner_generation(&self) -> Option<u64> {
+        self.auth_manager().map(|manager| {
+            manager
+                .auth_change_state_receiver()
+                .borrow()
+                .owner_generation
+        })
+    }
+
+    fn take_cached_websocket_session(&self) -> WebsocketSession {
+        let mut cached_websocket_session = self
+            .state
+            .cached_websocket_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *cached_websocket_session)
+    }
+
+    fn store_cached_websocket_session(&self, websocket_session: WebsocketSession) {
+        *self
+            .state
+            .cached_websocket_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = websocket_session;
+    }
+
+    pub(crate) fn force_http_fallback(
+        &self,
+        session_telemetry: &SessionTelemetry,
+        _model_info: &ModelInfo,
+    ) -> bool {
+        let websocket_enabled = self.responses_websocket_enabled();
+        let activated =
+            websocket_enabled && !self.state.disable_websockets.swap(true, Ordering::Relaxed);
+        if activated {
+            warn!("falling back to HTTP");
+            session_telemetry.counter(
+                "codex.transport.fallback_to_http",
+                /*inc*/ 1,
+                &[("from_wire_api", "responses_websocket")],
+            );
+        }
+
+        self.store_cached_websocket_session(WebsocketSession::default());
+        activated
+    }
+
+    pub(crate) async fn create_realtime_call_with_headers(
+        &self,
+        sdp: String,
+        session_config: ApiRealtimeSessionConfig,
+        mut extra_headers: ApiHeaderMap,
+        api_provider_override: Option<ApiProvider>,
+    ) -> Result<RealtimeWebrtcCallStart> {
+        // Create the media call over HTTP first, then retain matching auth so realtime can attach
+        // the server-side control WebSocket to the call id from that HTTP response.
+        let client_setup = self
+            .current_client_setup(ClientRouting::ConfiguredProvider)
+            .await?;
+        if let Some(header_value) = self.generate_attestation_header_for().await {
+            extra_headers.insert(X_OAI_ATTESTATION_HEADER, header_value);
+        }
+        let mut sideband_headers = extra_headers.clone();
+        sideband_headers.extend(sideband_websocket_auth_headers(
+            client_setup.api_auth.as_ref(),
+        ));
+        let api_provider = api_provider_override.unwrap_or(client_setup.api_provider);
+        let transport = self.build_api_transport(
+            &api_provider,
+            REALTIME_CALLS_ENDPOINT,
+            client_setup.redirect_policy,
+        )?;
+        let response = ApiRealtimeCallClient::new(transport, api_provider, client_setup.api_auth)
+            .create_with_session_and_headers(sdp, session_config, extra_headers)
+            .await
+            .map_err(|error| self.state.provider.map_api_error(error))?;
+        Ok(RealtimeWebrtcCallStart {
+            sdp: response.sdp,
+            call_id: response.call_id,
+            sideband_headers,
+        })
+    }
+
+    pub(crate) async fn realtime_sideband_headers(
+        &self,
+        mut extra_headers: ApiHeaderMap,
+    ) -> Result<ApiHeaderMap> {
+        let client_setup = self
+            .current_client_setup(ClientRouting::ConfiguredProvider)
+            .await?;
+        if let Some(header_value) = self.generate_attestation_header_for().await {
+            extra_headers.insert(X_OAI_ATTESTATION_HEADER, header_value);
+        }
+        extra_headers.extend(sideband_websocket_auth_headers(
+            client_setup.api_auth.as_ref(),
+        ));
+        Ok(extra_headers)
+    }
+
+    /// Builds memory summaries for each provided normalized raw memory.
+    ///
+    /// This is a unary call (no streaming) to `/v1/memories/trace_summarize`.
+    ///
+    /// The model selection, reasoning effort, and telemetry context are passed explicitly to keep
+    /// `ModelClient` session-scoped.
+    pub async fn summarize_memories(
+        &self,
+        raw_memories: Vec<ApiRawMemory>,
+        model_info: &ModelInfo,
+        effort: Option<ReasoningEffortConfig>,
+        session_telemetry: &SessionTelemetry,
+    ) -> Result<Vec<ApiMemorySummarizeOutput>> {
+        if raw_memories.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let client_setup = self
+            .current_client_setup(ClientRouting::ConfiguredProvider)
+            .await?;
+        let transport = self.build_api_transport(
+            &client_setup.api_provider,
+            MEMORIES_SUMMARIZE_ENDPOINT,
+            client_setup.redirect_policy,
+        )?;
+        let request_telemetry = Self::build_request_telemetry(
+            session_telemetry,
+            AuthRequestTelemetryContext::new(
+                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                client_setup.api_auth.as_ref(),
+                client_setup.agent_identity_telemetry.clone(),
+                PendingUnauthorizedRetry::default(),
+            ),
+            RequestRouteTelemetry::for_endpoint(MEMORIES_SUMMARIZE_ENDPOINT),
+            self.state.auth_env_telemetry.clone(),
+        );
+        let client =
+            ApiMemoriesClient::new(transport, client_setup.api_provider, client_setup.api_auth)
+                .with_telemetry(Some(request_telemetry));
+
+        let payload = ApiMemorySummarizeInput {
+            model: model_info.slug.clone(),
+            raw_memories,
+            reasoning: effort
+                .map(|effort| model_info.resolve_reasoning_effort(effort))
+                .map(|effort| Reasoning {
+                    effort: Some(effort),
+                    summary: None,
+                    context: None,
+                }),
+        };
+
+        client
+            .summarize_input(&payload, self.build_subagent_headers())
+            .await
+            .map_err(|error| self.state.provider.map_api_error(error))
+    }
+
+    fn build_subagent_headers(&self) -> ApiHeaderMap {
+        let mut extra_headers = ApiHeaderMap::new();
+        add_originator_header(&mut extra_headers, self.state.originator.as_str());
+        if let Some(subagent) = subagent_header_value(&self.state.session_source)
+            && let Ok(val) = HeaderValue::from_str(&subagent)
+        {
+            extra_headers.insert(X_OPENAI_SUBAGENT_HEADER, val);
+        }
+        if matches!(
+            self.state.session_source,
+            SessionSource::Internal(InternalSessionSource::MemoryConsolidation)
+        ) {
+            extra_headers.insert(
+                X_OPENAI_MEMGEN_REQUEST_HEADER,
+                HeaderValue::from_static("true"),
+            );
+        }
+        extra_headers
+    }
+
+    fn build_responses_compatibility_headers(
+        &self,
+        responses_metadata: &CodexResponsesMetadata,
+    ) -> ApiHeaderMap {
+        let mut extra_headers = responses_metadata.compatibility_headers();
+        if matches!(
+            self.state.session_source,
+            SessionSource::Internal(InternalSessionSource::MemoryConsolidation)
+        ) {
+            extra_headers.insert(
+                X_OPENAI_MEMGEN_REQUEST_HEADER,
+                HeaderValue::from_static("true"),
+            );
+        }
+        extra_headers
+    }
+
+    fn build_ws_client_metadata(
+        &self,
+        responses_metadata: &CodexResponsesMetadata,
+        include_internal: bool,
+        use_responses_lite: bool,
+    ) -> HashMap<String, String> {
+        let mut client_metadata = responses_metadata.client_metadata(include_internal);
+        if use_responses_lite {
+            client_metadata.insert(
+                WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY.to_string(),
+                "true".to_string(),
+            );
+        }
+        client_metadata
+    }
+
+    async fn generate_attestation_header_for(&self) -> Option<HeaderValue> {
+        if !self.state.include_attestation {
+            return None;
+        }
+
+        self.state
+            .attestation_provider
+            .as_ref()?
+            .header_for_request(AttestationContext {
+                thread_id: self.state.thread_id,
+            })
+            .await
+    }
+
+    /// Builds request telemetry for unary API calls (e.g., Compact endpoint).
+    fn build_request_telemetry(
+        session_telemetry: &SessionTelemetry,
+        auth_context: AuthRequestTelemetryContext,
+        request_route_telemetry: RequestRouteTelemetry,
+        auth_env_telemetry: AuthEnvTelemetry,
+    ) -> Arc<dyn RequestTelemetry> {
+        let telemetry = Arc::new(ApiTelemetry::new(
+            session_telemetry.clone(),
+            auth_context,
+            request_route_telemetry,
+            auth_env_telemetry,
+        ));
+        let request_telemetry: Arc<dyn RequestTelemetry> = telemetry;
+        request_telemetry
+    }
+
+    fn build_reasoning(
+        &self,
+        model_info: &ModelInfo,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+    ) -> Reasoning {
+        Reasoning {
+            effort: effort
+                .or_else(|| model_info.default_reasoning_level.clone())
+                .map(|effort| model_info.resolve_reasoning_effort(effort)),
+            summary: (model_info.supports_reasoning_summary_parameter
+                && summary != ReasoningSummaryConfig::None)
+                .then_some(summary),
+            // When Responses Lite is disabled, omit context so Responses uses the default,
+            // which is currently `current_turn`.
+            context: model_info
+                .use_responses_lite
+                .then_some(ReasoningContext::AllTurns),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_responses_request(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+        include_internal: bool,
+    ) -> Result<ResponsesApiRequest> {
+        let mut input = prompt.get_formatted_input_for_request(model_info);
+        let provider_info = self.state.provider.info();
+        let store = codex_api::is_azure_responses_provider(
+            &provider_info.name,
+            provider_info.base_url.as_deref(),
+        );
+        if !store {
+            input.retain(|item| {
+                !matches!(
+                    item,
+                    ResponseItem::Reasoning {
+                        encrypted_content: None,
+                        ..
+                    }
+                )
+            });
+        }
+        if !self.reasoning_effort_override_enabled(model_info) {
+            // Unsupported models and disabled overrides must also accept saved history.
+            // Filter only the request copy; persisted history remains unchanged.
+            input.retain(|item| !matches!(item, ResponseItem::ConfigurationUpdate { .. }));
+        }
+        let is_openai = self.state.provider.info().is_openai();
+        if !is_openai {
+            let own_agent_path = self
+                .state
+                .session_source
+                .get_agent_path()
+                .unwrap_or_else(codex_protocol::AgentPath::root)
+                .to_string();
+            input = flatten_agent_messages_for_responses(input, &own_agent_path);
+        }
+        let (instructions, tools) = if model_info.use_responses_lite {
+            // These prompt-only items are rebuilt on every request. Hash their visible payloads
+            // within the thread so retries and resumed sessions preserve their identity.
+            let prefix_namespace = Uuid::new_v5(
+                &Uuid::NAMESPACE_OID,
+                self.state.thread_id.to_string().as_bytes(),
+            );
+            let tools = if self.state.provider.capabilities().namespace_tools {
+                create_tools_json_for_responses_lite(&prompt.tools)?
+            } else {
+                create_tools_json_for_responses_api(&prompt.tools)?
+            };
+            let mut prefix = vec![ResponseItem::AdditionalTools {
+                id: Some(ResponseItemId::with_suffix(
+                    "at",
+                    Uuid::new_v5(&prefix_namespace, &serde_json::to_vec(&tools)?),
+                )),
+                role: "developer".to_string(),
+                tools,
+            }];
+            if !prompt.base_instructions.text.is_empty() {
+                let mut instructions = ContextualUserFragment::into(BaseInstructionsFragment(
+                    prompt.base_instructions.text.clone(),
+                ));
+                instructions.set_id(Some(ResponseItemId::with_suffix(
+                    "msg",
+                    Uuid::new_v5(&prefix_namespace, prompt.base_instructions.text.as_bytes()),
+                )));
+                prefix.push(instructions);
+            }
+            input.splice(0..0, prefix);
+            (String::new(), None)
+        } else {
+            (
+                prompt.base_instructions.text.clone(),
+                Some(create_tools_raw_json_for_responses_api(&prompt.tools)?.into()),
+            )
+        };
+        if !is_openai {
+            for item in &mut input {
+                item.clear_internal_chat_message_metadata_passthrough();
+                if let ResponseItem::FunctionCall {
+                    encrypted_function_args,
+                    ..
+                } = item
+                {
+                    *encrypted_function_args = None;
+                }
+            }
+        }
+        let reasoning = self.build_reasoning(model_info, effort, summary);
+        let stream_options = (self.state.concurrent_reasoning_summaries_enabled
+            && is_openai
+            && reasoning.summary.is_some())
+        .then_some(StreamOptions {
+            reasoning_summary_delivery: codex_api::ReasoningSummaryDelivery::SequentialCutoff,
+        });
+        let include = vec!["reasoning.encrypted_content".to_string()];
+        let verbosity = if model_info.support_verbosity {
+            self.state.model_verbosity.or(model_info.default_verbosity)
+        } else {
+            if self.state.model_verbosity.is_some() {
+                warn!(
+                    "model_verbosity is set but ignored as the model does not support verbosity: {}",
+                    model_info.slug
+                );
+            }
+            None
+        };
+        let text = create_text_param_for_request(
+            verbosity,
+            &prompt.output_schema,
+            prompt.output_schema_strict,
+        );
+        let prompt_cache_key = Some(self.prompt_cache_key(responses_metadata));
+        let service_tier = if self.state.provider.info().is_amazon_bedrock() {
+            // Bedrock only supports the implicit default tier, including with custom catalogs.
+            None
+        } else {
+            model_info.service_tier_for_request(service_tier)
+        };
+        if !include_internal {
+            for item in &mut input {
+                item.clear_tool_result_metadata();
+            }
+        }
+        let client_metadata = responses_metadata.client_metadata(include_internal);
+        let request = ResponsesApiRequest {
+            model: model_info.slug.clone(),
+            instructions,
+            input,
+            tools,
+            tool_choice: "auto".to_string(),
+            reasoning: Some(reasoning),
+            store,
+            stream: true,
+            parallel_tool_calls: prompt.parallel_tool_calls && !model_info.use_responses_lite,
+            stream_options,
+            include,
+            service_tier,
+            prompt_cache_key,
+            text,
+            client_metadata: Some(client_metadata),
+            access_programs: None,
+        };
+        Ok(request)
+    }
+
+    fn prepare_response_items_for_request(&self, input: &mut [ResponseItem]) {
+        for item in input {
+            if !item.has_responses_api_id() {
+                item.set_id(/*new_id*/ None);
+            }
+            if !self.state.content_item_kinds_enabled {
+                item.clear_content_item_kinds();
+            }
+        }
+    }
+
+    /// Returns whether the Responses-over-WebSocket transport is active for this session.
+    ///
+    /// WebSocket use is controlled by provider capability and session-scoped fallback state.
+    pub fn responses_websocket_enabled(&self) -> bool {
+        if !self.state.provider.info().supports_websockets
+            || self.state.disable_websockets.load(Ordering::Relaxed)
+        {
+            return false;
+        }
+
+        true
+    }
+
+    /// Returns auth + provider configuration resolved from the current session auth state.
+    ///
+    /// This centralizes setup used by both prewarm and normal request paths so they stay in
+    /// lockstep when auth/provider resolution changes.
+    async fn current_client_setup(&self, routing: ClientRouting) -> Result<CurrentClientSetup> {
+        // Capture before resolving credentials so an account switch during setup cannot label
+        // an old connection with the new owner's revision.
+        let auth_owner_generation = self.auth_owner_generation();
+        let auth_changes = self
+            .state
+            .provider
+            .auth_manager()
+            .map(|manager| manager.auth_change_receiver());
+        loop {
+            let revision = auth_changes.as_ref().map(|changes| *changes.borrow());
+            let auth = self.state.provider.auth().await;
+            let (api_provider, redirect_policy) = match routing {
+                ClientRouting::Workspace => {
+                    let resolved = self
+                        .state
+                        .provider
+                        .responses_api_provider(&self.state.workspace_routing)
+                        .await?;
+                    (resolved.provider, resolved.redirect_policy)
+                }
+                ClientRouting::ConfiguredProvider => (
+                    self.state.provider.api_provider().await?,
+                    ClientRedirectPolicy::Default,
+                ),
+            };
+            let resolved_auth = self
+                .state
+                .provider
+                .api_auth_for_scope(ProviderAuthScope {
+                    agent_identity_policy: self.agent_identity_policy,
+                    session_source: self.state.session_source.clone(),
+                    agent_identity_session_fallback: self
+                        .state
+                        .agent_identity_session_fallback
+                        .clone(),
+                })
+                .await?;
+            // Command-backed bearer refreshes cannot change workspace routing. Keep the captured
+            // revisions so a refresh during setup still invalidates cached WebSocket state.
+            if self.state.provider.info().auth.is_none() {
+                if self.auth_owner_generation() != auth_owner_generation {
+                    return Err(std::io::Error::other(
+                        "account changed while preparing model request",
+                    )
+                    .into());
+                }
+                // Rebuild the entire bundle after a credential-only refresh, including routing.
+                if auth_changes.as_ref().map(|changes| *changes.borrow()) != revision {
+                    continue;
+                }
+            }
+            return Ok(CurrentClientSetup {
+                auth,
+                auth_owner_generation,
+                auth_revision: revision,
+                api_provider,
+                redirect_policy,
+                api_auth: resolved_auth.auth,
+                agent_identity_telemetry: resolved_auth.agent_identity_telemetry,
+            });
+        }
+    }
+
+    fn responses_headers(&self, auth: Option<&CodexAuth>, model: &str) -> ApiHeaderMap {
+        self.codex_responses_headers
+            .as_ref()
+            .filter(|config| {
+                config.model == model
+                    && self.uses_codex_backend(auth)
+                    && self.state.provider.info().supports_codex_backend_routes()
+            })
+            .map(|config| config.headers.clone())
+            .unwrap_or_default()
+    }
+
+    fn uses_codex_backend(&self, auth: Option<&CodexAuth>) -> bool {
+        let provider = self.state.provider.info();
+        auth.is_some_and(CodexAuth::uses_codex_backend)
+            && provider.is_openai()
+            && provider.requires_openai_auth
+            && provider.env_key.is_none()
+            && provider.experimental_bearer_token.is_none()
+            && provider.auth.is_none()
+            && provider.aws.is_none()
+    }
+
+    fn set_guardian_metadata(
+        &self,
+        metadata: &mut Option<HashMap<String, String>>,
+        parent_response_id: Option<&str>,
+        auth: Option<&CodexAuth>,
+        responses_headers: &ApiHeaderMap,
+    ) {
+        if let Some(metadata) = metadata.as_mut() {
+            metadata.remove("guardian_credits_requested");
+            metadata.remove("parent_response_id");
+        }
+        let guardian_reviewer = is_guardian_reviewer(responses_headers);
+        if guardian_reviewer && let Some(parent_response_id) = parent_response_id {
+            metadata.get_or_insert_with(HashMap::new).insert(
+                "parent_response_id".to_owned(),
+                parent_response_id.to_owned(),
+            );
+        }
+        if !guardian_reviewer
+            && !crate::guardian::is_basic_session_source(&self.state.session_source)
+            && matches!(
+                auth,
+                Some(CodexAuth::Chatgpt(_) | CodexAuth::ChatgptAuthTokens(_))
+            )
+            && self.uses_codex_backend(auth)
+            && self.state.provider.info().supports_codex_backend_routes()
+        {
+            metadata
+                .get_or_insert_with(HashMap::new)
+                .insert("guardian_credits_requested".to_owned(), "true".to_owned());
+        }
+    }
+
+    fn build_routing_hint_header(
+        &self,
+        auth: Option<&CodexAuth>,
+        responses_headers: &ApiHeaderMap,
+        model: &str,
+        service_tier: Option<&str>,
+    ) -> Option<HeaderValue> {
+        if !self.uses_codex_backend(auth) || is_guardian_reviewer(responses_headers) {
+            return None;
+        }
+
+        let routing_hint = match service_tier {
+            Some(tier) => format!("model={model};tier={tier}"),
+            None => format!("model={model}"),
+        };
+        HeaderValue::from_str(&routing_hint).ok()
+    }
+
+    fn build_api_transport(
+        &self,
+        api_provider: &ApiProvider,
+        endpoint: &str,
+        redirect_policy: ClientRedirectPolicy,
+    ) -> Result<ReqwestTransport> {
+        let redirect_policy = if api_provider
+            .headers
+            .contains_key(codex_model_provider::ACCOUNT_ROUTING_HEADER)
+        {
+            ClientRedirectPolicy::Reject
+        } else {
+            redirect_policy
+        };
+        let client = create_client_for_route(
+            &self.http_client_factory,
+            &api_provider.url_for_path(endpoint),
+            ClientRouteClass::Api,
+            redirect_policy,
+        )
+        .map_err(std::io::Error::from)?;
+        Ok(ReqwestTransport::from_http_client(client))
+    }
+
+    pub(crate) async fn prewarm_auth(&self) -> Result<()> {
+        self.current_client_setup(ClientRouting::Workspace)
+            .await
+            .map(|_| ())
+    }
+
+    /// Opens a websocket connection using the same header and telemetry wiring as normal turns.
+    ///
+    /// Both startup prewarm and in-turn `needs_new` reconnects call this path so handshake
+    /// behavior remains consistent across both flows.
+    #[allow(clippy::too_many_arguments)]
+    async fn connect_websocket(
+        &self,
+        session_telemetry: &SessionTelemetry,
+        api_provider: codex_api::Provider,
+        api_auth: SharedAuthProvider,
+        responses_metadata: &CodexResponsesMetadata,
+        auth_context: AuthRequestTelemetryContext,
+        request_route_telemetry: RequestRouteTelemetry,
+        responses_headers: &ApiHeaderMap,
+    ) -> std::result::Result<ApiWebSocketConnection, ApiError> {
+        let mut headers = self.build_websocket_headers(responses_metadata).await;
+        headers.extend(responses_headers.clone());
+        let websocket_telemetry = ModelClientSession::build_websocket_telemetry(
+            session_telemetry,
+            auth_context.clone(),
+            request_route_telemetry,
+            self.state.auth_env_telemetry.clone(),
+        );
+        let websocket_connect_timeout = self.state.provider.info().websocket_connect_timeout();
+        let start = Instant::now();
+        let result = match tokio::time::timeout(
+            websocket_connect_timeout,
+            ApiWebSocketResponsesClient::new(api_provider, api_auth).connect(
+                &self.http_client_factory,
+                headers,
+                codex_login::default_client::default_headers(),
+                /*turn_state*/ None,
+                Some(websocket_telemetry),
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(ApiError::Transport(TransportError::Timeout)),
+        };
+        let error_message = result.as_ref().err().map(telemetry_api_error_message);
+        let response_debug = result
+            .as_ref()
+            .err()
+            .map(extract_response_debug_context_from_api_error)
+            .unwrap_or_default();
+        let status = result.as_ref().err().and_then(api_error_http_status);
+        session_telemetry.record_websocket_connect(
+            start.elapsed(),
+            status,
+            error_message.as_deref(),
+            auth_context.auth_header_attached,
+            auth_context.auth_header_name,
+            auth_context.retry_after_unauthorized,
+            auth_context.recovery_mode,
+            auth_context.recovery_phase,
+            request_route_telemetry.endpoint,
+            /*connection_reused*/ false,
+            response_debug.request_id.as_deref(),
+            response_debug.cf_ray.as_deref(),
+            response_debug.auth_error.as_deref(),
+            response_debug.auth_error_code.as_deref(),
+            auth_context.agent_identity_telemetry(),
+        );
+        emit_feedback_request_tags_with_auth_env(
+            &FeedbackRequestTags {
+                endpoint: request_route_telemetry.endpoint,
+                auth_header_attached: auth_context.auth_header_attached,
+                auth_header_name: auth_context.auth_header_name,
+                auth_mode: auth_context.auth_mode,
+                auth_retry_after_unauthorized: Some(auth_context.retry_after_unauthorized),
+                auth_recovery_mode: auth_context.recovery_mode,
+                auth_recovery_phase: auth_context.recovery_phase,
+                auth_connection_reused: Some(false),
+                auth_request_id: response_debug.request_id.as_deref(),
+                auth_cf_ray: response_debug.cf_ray.as_deref(),
+                auth_error: response_debug.auth_error.as_deref(),
+                auth_error_code: response_debug.auth_error_code.as_deref(),
+                auth_recovery_followup_success: auth_context
+                    .retry_after_unauthorized
+                    .then_some(result.is_ok()),
+                auth_recovery_followup_status: auth_context
+                    .retry_after_unauthorized
+                    .then_some(status)
+                    .flatten(),
+            },
+            &self.state.auth_env_telemetry,
+        );
+        result
+    }
+
+    /// Builds websocket handshake headers for both prewarm and turn-time reconnect.
+    async fn build_websocket_headers(
+        &self,
+        responses_metadata: &CodexResponsesMetadata,
+    ) -> ApiHeaderMap {
+        let mut headers = build_responses_headers(
+            self.state.beta_features_header.as_deref(),
+            /*turn_state*/ None,
+        );
+        add_originator_header(&mut headers, self.state.originator.as_str());
+        if let Ok(header_value) = HeaderValue::from_str(&responses_metadata.thread_id) {
+            headers.insert("x-client-request-id", header_value);
+        }
+        headers.extend(build_session_headers(
+            Some(self.responses_session_id(responses_metadata)),
+            Some(responses_metadata.thread_id.to_string()),
+        ));
+        headers.extend(self.build_responses_compatibility_headers(responses_metadata));
+        if let Some(routing_hint) = &responses_metadata.routing_hint {
+            headers.insert(X_CODEX_ROUTING_HINT_HEADER, routing_hint.clone());
+        }
+        if let Some(header_value) = self.generate_attestation_header_for().await {
+            headers.insert(X_OAI_ATTESTATION_HEADER, header_value);
+        }
+        headers.insert(
+            OPENAI_BETA_HEADER,
+            HeaderValue::from_static(RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE),
+        );
+        if self.state.include_timing_metrics {
+            headers.insert(
+                X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER,
+                HeaderValue::from_static("true"),
+            );
+        }
+        headers
+    }
+}
+
+impl Drop for ModelClientSession {
+    fn drop(&mut self) {
+        let websocket_session = std::mem::take(&mut self.websocket_session);
+        self.client
+            .store_cached_websocket_session(websocket_session);
+    }
+}
+
+fn agent_message_text(content: &[AgentMessageInputContent]) -> Option<String> {
+    let text = content
+        .iter()
+        .map(|part| match part {
+            AgentMessageInputContent::InputText { text } => text.as_str(),
+            AgentMessageInputContent::EncryptedContent { encrypted_content } => {
+                encrypted_content.as_str()
+            }
+        })
+        .collect::<String>();
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn agent_message_role(author: &str, own_agent_path: &str) -> &'static str {
+    if author == own_agent_path {
+        "assistant"
+    } else {
+        "user"
+    }
+}
+
+fn flatten_agent_messages_for_responses(
+    input: Vec<ResponseItem>,
+    own_agent_path: &str,
+) -> Vec<ResponseItem> {
+    input
+        .into_iter()
+        .filter_map(|item| {
+            let ResponseItem::AgentMessage {
+                id,
+                author,
+                content,
+                ..
+            } = item
+            else {
+                return Some(item);
+            };
+            let text = agent_message_text(&content)?;
+            let role = agent_message_role(&author, own_agent_path);
+            let content = if role == "assistant" {
+                codex_protocol::models::ContentItem::OutputText { text }
+            } else {
+                codex_protocol::models::ContentItem::InputText { text }
+            };
+            Some(ResponseItem::Message {
+                id,
+                role: role.to_string(),
+                content: vec![content],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            })
+        })
+        .collect()
+}
+
+impl ModelClientSession {
+    pub(crate) fn turn_state(&self) -> Arc<OnceLock<String>> {
+        Arc::clone(&self.turn_state)
+    }
+
+    /// Whether this session's client uses the same provider configuration as
+    /// `provider`.
+    pub(crate) fn has_same_provider(&self, provider: &SharedModelProvider) -> bool {
+        self.client.state.provider.info() == provider.info()
+    }
+
+    /// Installs a notifier that is fired when Chat Completions or Anthropic
+    /// streaming retries after a transient error. Set by the turn layer so
+    /// retry progress (attempt number + error code) can be surfaced to the UI.
+    pub(crate) fn set_stream_error_notifier(
+        &mut self,
+        notifier: Option<Arc<dyn StreamErrorNotifier>>,
+    ) {
+        self.stream_error_notifier = notifier;
+    }
+
+    /// Fires the retry notifier, if installed. No-op when no notifier is set
+    /// (e.g. for Responses paths that have their own retry notifications).
+    fn notify_stream_retry(
+        &self,
+        message: String,
+        additional_details: String,
+        http_status_code: Option<u16>,
+    ) {
+        if let Some(notifier) = &self.stream_error_notifier {
+            notifier.notify(message, additional_details, http_status_code);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Builds shared Responses API transport options and request-body options.
+    ///
+    /// Keeping option construction in one place ensures request-scoped headers are consistent
+    /// regardless of transport choice.
+    async fn build_responses_options(
+        &self,
+        responses_metadata: &CodexResponsesMetadata,
+        compression: Compression,
+        use_responses_lite: bool,
+    ) -> ApiResponsesOptions {
+        ApiResponsesOptions {
+            session_id: Some(self.client.responses_session_id(responses_metadata)),
+            thread_id: Some(responses_metadata.thread_id.to_string()),
+            session_source: Some(self.client.state.session_source.clone()),
+            extra_headers: {
+                let mut headers = build_responses_headers(
+                    self.client.state.beta_features_header.as_deref(),
+                    Some(&self.turn_state),
+                );
+                add_originator_header(&mut headers, self.client.state.originator.as_str());
+                headers.extend(
+                    self.client
+                        .build_responses_compatibility_headers(responses_metadata),
+                );
+                if let Some(header_value) = self.client.generate_attestation_header_for().await {
+                    headers.insert(X_OAI_ATTESTATION_HEADER, header_value);
+                }
+                add_responses_lite_header(&mut headers, use_responses_lite);
+                headers
+            },
+            compression,
+            turn_state: Some(Arc::clone(&self.turn_state)),
+        }
+    }
+
+    /// Checks whether the current request is an incremental extension of the previous request.
+    /// We only reuse an incremental input delta when non-input request fields are unchanged and
+    /// `input` extends or equals the previous known input. Server-returned output items
+    /// are treated as part of the baseline so we do not resend them.
+    fn get_incremental_items(
+        &self,
+        request: &ResponsesApiRequest,
+        last_response: &LastResponse,
+    ) -> Option<Vec<ResponseItem>> {
+        let previous_request = self.websocket_session.last_request.as_ref()?;
+        if !responses_request_properties_match(previous_request, request) {
+            trace!("incremental request failed, websocket reuse properties didn't match");
+            return None;
+        }
+
+        let response_items = &last_response.items_added;
+        let previous_items_len = previous_request
+            .input
+            .len()
+            .checked_add(response_items.len())?;
+        let Some((request_items_to_compare, incremental_items)) =
+            request.input.split_at_checked(previous_items_len)
+        else {
+            trace!("incremental request failed, incompatible request length");
+            return None;
+        };
+        let previous_items = previous_request.input.iter().chain(response_items);
+        if !previous_items
+            .zip(request_items_to_compare)
+            .all(|(previous, current)| {
+                response_items_equal_ignoring_internal_metadata(previous, current)
+            })
+        {
+            trace!("incremental request failed, items didn't match");
+            return None;
+        }
+        Some(incremental_items.to_vec())
+    }
+
+    fn get_last_response(&mut self) -> Option<LastResponse> {
+        self.websocket_session
+            .last_response_rx
+            .take()
+            .and_then(|mut receiver| match receiver.try_recv() {
+                Ok(last_response) => Some(last_response),
+                Err(TryRecvError::Closed) | Err(TryRecvError::Empty) => None,
+            })
+    }
+
+    fn prepare_websocket_request(
+        &mut self,
+        request: &ResponsesApiRequest,
+    ) -> Option<WebsocketContinuation> {
+        let last_response = self.get_last_response()?;
+        let items = self.get_incremental_items(request, &last_response)?;
+
+        if last_response.response_id.is_empty() {
+            trace!("incremental request failed, no previous response id");
+            return None;
+        }
+
+        Some(WebsocketContinuation {
+            response_id: last_response.response_id,
+            items,
+            from_untraced_warmup: self.websocket_session.last_response_from_untraced_warmup,
+        })
+    }
+
+    /// Opportunistically preconnects a websocket for this turn-scoped client session.
+    ///
+    /// This performs only connection setup; it never sends prompt payloads.
+    pub async fn preconnect_websocket(
+        &mut self,
+        model_info: &ModelInfo,
+        service_tier: Option<String>,
+        session_telemetry: &SessionTelemetry,
+        responses_metadata: &CodexResponsesMetadata,
+    ) -> Result<()> {
+        if !self.client.responses_websocket_enabled() {
+            return Ok(());
+        }
+        let provider = Arc::clone(&self.client.state.provider);
+        let auth_manager = provider.auth_manager();
+        let mut auth_recovery = auth_manager
+            .as_ref()
+            .map(AuthManager::unauthorized_recovery);
+        let mut provider_auth_recovery_attempted = false;
+        let mut pending_retry = PendingUnauthorizedRetry::default();
+        loop {
+            let client_setup = self
+                .client
+                .current_client_setup(ClientRouting::Workspace)
+                .await?;
+            let auth_context = AuthRequestTelemetryContext::new(
+                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                client_setup.api_auth.as_ref(),
+                client_setup.agent_identity_telemetry.clone(),
+                pending_retry,
+            );
+            let responses_headers = self
+                .client
+                .responses_headers(client_setup.auth.as_ref(), &model_info.slug);
+            let mut websocket_metadata = responses_metadata.clone();
+            websocket_metadata.routing_hint = self.client.build_routing_hint_header(
+                client_setup.auth.as_ref(),
+                &responses_headers,
+                &model_info.slug,
+                model_info
+                    .service_tier_for_request(service_tier.clone())
+                    .as_deref(),
+            );
+            match self
+                .websocket_connection(WebsocketConnectParams {
+                    session_telemetry,
+                    api_provider: client_setup.api_provider,
+                    auth_revision: client_setup.auth_revision,
+                    api_auth: client_setup.api_auth,
+                    auth_owner_generation: client_setup.auth_owner_generation,
+                    responses_metadata: &websocket_metadata,
+                    auth_context,
+                    request_route_telemetry: RequestRouteTelemetry::for_endpoint("/responses"),
+                    responses_headers: &responses_headers,
+                })
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(ApiError::Transport(TransportError::Http { status, .. }))
+                    if status == StatusCode::UPGRADE_REQUIRED =>
+                {
+                    self.try_switch_fallback_transport(session_telemetry, model_info);
+                    return Ok(());
+                }
+                Err(ApiError::Transport(unauthorized_transport))
+                    if provider.is_recoverable_auth_error(&unauthorized_transport) =>
+                {
+                    pending_retry = PendingUnauthorizedRetry::from_recovery(
+                        handle_unauthorized(
+                            unauthorized_transport,
+                            &mut auth_recovery,
+                            &mut provider_auth_recovery_attempted,
+                            session_telemetry,
+                            &provider,
+                            self.client.event_sender.as_ref(),
+                            responses_metadata.turn_id.as_deref(),
+                        )
+                        .await?,
+                    );
+                }
+                Err(err) => return Err(provider.map_api_error(err)),
+            }
+        }
+    }
+
+    /// Returns a websocket connection for this turn.
+    #[instrument(
+        name = "model_client.websocket_connection",
+        level = "info",
+        skip_all,
+        fields(
+            provider = %self.client.state.provider.info().name,
+            wire_api = %self.client.state.provider.info().wire_api,
+            transport = "responses_websocket",
+            api.path = "/responses",
+            turn.has_metadata_header = params.responses_metadata.has_turn_metadata()
+        )
+    )]
+    async fn websocket_connection(
+        &mut self,
+        params: WebsocketConnectParams<'_>,
+    ) -> std::result::Result<&ApiWebSocketConnection, ApiError> {
+        let WebsocketConnectParams {
+            session_telemetry,
+            api_provider,
+            auth_revision,
+            api_auth,
+            auth_owner_generation,
+            responses_metadata,
+            auth_context,
+            request_route_telemetry,
+            responses_headers,
+        } = params;
+        let connection_key = ResponsesConnectionKey::new(&api_provider, auth_revision);
+        let reset_reason = match self.websocket_session.connection.as_ref() {
+            Some(_)
+                if self.websocket_session.responses_headers != *responses_headers
+                    || self.websocket_session.connection_key.as_ref() != Some(&connection_key) =>
+            {
+                Some("other")
+            }
+            Some(conn) if conn.is_closed().await => Some("connection_closed"),
+            Some(_) | None => None,
+        };
+        let needs_new = self.websocket_session.connection.is_none() || reset_reason.is_some();
+        // Resolving an external auth provider can change ownership during client setup.
+        let owner_changed = self.websocket_session.auth_owner_generation != auth_owner_generation
+            || self.client.auth_owner_generation() != auth_owner_generation;
+        if owner_changed {
+            self.turn_state = Arc::new(OnceLock::new());
+        }
+
+        if needs_new || owner_changed {
+            self.websocket_session.reset(if owner_changed {
+                Some("other")
+            } else {
+                reset_reason
+            });
+            let new_conn = self
+                .client
+                .connect_websocket(
+                    session_telemetry,
+                    api_provider,
+                    api_auth,
+                    responses_metadata,
+                    auth_context,
+                    request_route_telemetry,
+                    responses_headers,
+                )
+                .await?;
+            self.websocket_session.connection = Some(new_conn);
+            self.websocket_session.responses_headers = responses_headers.clone();
+            self.websocket_session.auth_owner_generation = auth_owner_generation;
+            self.websocket_session.connection_key = Some(connection_key);
+            self.websocket_session
+                .set_connection_reused(/*connection_reused*/ false);
+        } else {
+            self.websocket_session
+                .set_connection_reused(/*connection_reused*/ true);
+        }
+
+        self.websocket_session
+            .connection
+            .as_ref()
+            .ok_or(ApiError::Stream(
+                "websocket connection is unavailable".to_string(),
+            ))
+    }
+
+    fn responses_request_compression(&self, auth: Option<&CodexAuth>) -> Compression {
+        if self.client.state.enable_request_compression
+            && auth.is_some_and(CodexAuth::uses_codex_backend)
+            && self.client.state.provider.info().is_openai()
+        {
+            Compression::Zstd
+        } else {
+            Compression::None
+        }
+    }
+
+    /// Streams a turn via the OpenAI Responses API.
+    ///
+    /// Handles reasoning summaries, verbosity, and the `text` controls used for output schemas.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(
+        name = "model_client.stream_responses_api",
+        level = "info",
+        skip_all,
+        fields(
+            model = %model_info.slug,
+            wire_api = %self.client.state.provider.info().wire_api,
+            transport = "responses_http",
+            http.method = "POST",
+            api.path = tracing::field::Empty,
+            turn.has_metadata_header = responses_metadata.has_turn_metadata()
+        )
+    )]
+    async fn stream_responses_api(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+        inference_trace: &InferenceTraceContext,
+    ) -> Result<ResponseStream> {
+        let auth_manager = self.client.state.provider.auth_manager();
+        let mut auth_recovery = auth_manager
+            .as_ref()
+            .map(AuthManager::unauthorized_recovery);
+        let mut provider_auth_recovery_attempted = false;
+        let mut pending_retry = PendingUnauthorizedRetry::default();
+        loop {
+            let client_setup = self
+                .client
+                .current_client_setup(ClientRouting::Workspace)
+                .await?;
+            let include_internal = self
+                .client
+                .state
+                .provider
+                .include_internal_metadata(&client_setup.api_provider);
+            let responses_headers = self
+                .client
+                .responses_headers(client_setup.auth.as_ref(), &model_info.slug);
+            tracing::Span::current().record("api.path", "/responses");
+            let transport = self.client.build_api_transport(
+                &client_setup.api_provider,
+                "/responses",
+                client_setup.redirect_policy,
+            )?;
+            let request_auth_context = AuthRequestTelemetryContext::new(
+                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                client_setup.api_auth.as_ref(),
+                client_setup.agent_identity_telemetry.clone(),
+                pending_retry,
+            );
+            let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(
+                session_telemetry,
+                request_auth_context,
+                RequestRouteTelemetry::for_endpoint("/responses"),
+                self.client.state.auth_env_telemetry.clone(),
+            );
+            let compression = self.responses_request_compression(client_setup.auth.as_ref());
+            let mut options = self
+                .build_responses_options(
+                    responses_metadata,
+                    compression,
+                    model_info.use_responses_lite,
+                )
+                .await;
+
+            let mut request = self.client.build_responses_request(
+                prompt,
+                model_info,
+                effort.clone(),
+                summary,
+                service_tier.clone(),
+                responses_metadata,
+                include_internal,
+            )?;
+            self.client.set_guardian_metadata(
+                &mut request.client_metadata,
+                responses_metadata.parent_response_id.as_deref(),
+                client_setup.auth.as_ref(),
+                &responses_headers,
+            );
+            if is_guardian_reviewer(&responses_headers) {
+                request.service_tier = None;
+            }
+            if let Some(header_value) = self.client.build_routing_hint_header(
+                client_setup.auth.as_ref(),
+                &responses_headers,
+                &request.model,
+                request.service_tier.as_deref(),
+            ) {
+                options
+                    .extra_headers
+                    .insert(X_CODEX_ROUTING_HINT_HEADER, header_value);
+            }
+            request.access_programs = cyber_access_program::for_auth(
+                client_setup.auth.as_ref(),
+                prompt.cyber_access_program,
+            );
+            self.client
+                .prepare_response_items_for_request(&mut request.input);
+            if crate::guardian::is_basic_session_source(&self.client.state.session_source) {
+                crate::guardian::observe_guardian_request(session_telemetry, &request);
+            }
+            let request_session_telemetry =
+                session_telemetry_for_request(session_telemetry, &request);
+            options.extra_headers.extend(responses_headers);
+            let interceptors = crate::model_request::prepare(
+                &self.client.request_contributors,
+                &self.client.state.thread_id.to_string(),
+                &model_info.slug,
+                codex_extension_api::ModelRequestKind::Generation,
+                &mut request.client_metadata,
+            );
+            let inference_trace_attempt = inference_trace.start_attempt();
+            inference_trace_attempt.add_request_headers(&mut options.extra_headers);
+            if let Some(input) = tool_metadata::bounded_input(&request, &request.input) {
+                if let Some(recorder) = &self.client.executed_tool_calls {
+                    recorder.invalidate_wire_inventory_loss(&request.input, &input);
+                }
+                request.input = input;
+            }
+            inference_trace_attempt.record_started(&request);
+            let client = ApiResponsesClient::new(
+                transport,
+                client_setup.api_provider,
+                client_setup.api_auth,
+            )
+            .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+            let stream_result = client.stream_request(request, options).await;
+
+            match stream_result {
+                Ok(stream) => {
+                    let (stream, _) = map_response_stream(
+                        stream,
+                        request_session_telemetry,
+                        inference_trace_attempt,
+                        Arc::clone(&self.client.state.provider),
+                        interceptors,
+                    );
+                    return Ok(stream);
+                }
+                Err(ApiError::Transport(unauthorized_transport))
+                    if self
+                        .client
+                        .state
+                        .provider
+                        .is_recoverable_auth_error(&unauthorized_transport) =>
+                {
+                    let response_debug_context =
+                        extract_response_debug_context(&unauthorized_transport);
+                    inference_trace_attempt.record_failed(
+                        &unauthorized_transport,
+                        response_debug_context.request_id.as_deref(),
+                        /*output_items*/ &[],
+                    );
+                    pending_retry = PendingUnauthorizedRetry::from_recovery(
+                        handle_unauthorized(
+                            unauthorized_transport,
+                            &mut auth_recovery,
+                            &mut provider_auth_recovery_attempted,
+                            session_telemetry,
+                            &self.client.state.provider,
+                            self.client.event_sender.as_ref(),
+                            responses_metadata.turn_id.as_deref(),
+                        )
+                        .await?,
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    let response_debug_context =
+                        extract_response_debug_context_from_api_error(&err);
+                    let err = self.client.state.provider.map_api_error(err);
+                    inference_trace_attempt.record_failed(
+                        &err,
+                        response_debug_context.request_id.as_deref(),
+                        /*output_items*/ &[],
+                    );
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    /// Streams a turn via the Responses API over WebSocket transport.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(
+        name = "model_client.stream_responses_websocket",
+        level = "info",
+        skip_all,
+        fields(
+            model = %model_info.slug,
+            wire_api = %self.client.state.provider.info().wire_api,
+            transport = "responses_websocket",
+            api.path = tracing::field::Empty,
+            turn.has_metadata_header = responses_metadata.has_turn_metadata(),
+            websocket.warmup = warmup
+        )
+    )]
+    async fn stream_responses_websocket(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+        warmup: bool,
+        request_trace: Option<W3cTraceContext>,
+        inference_trace: &InferenceTraceContext,
+    ) -> Result<WebsocketStreamOutcome> {
+        let after_prewarm = !warmup && self.websocket_session.last_response_from_untraced_warmup;
+        let provider = Arc::clone(&self.client.state.provider);
+        let auth_manager = provider.auth_manager();
+
+        let mut auth_recovery = auth_manager
+            .as_ref()
+            .map(AuthManager::unauthorized_recovery);
+        let mut provider_auth_recovery_attempted = false;
+        let mut pending_retry = PendingUnauthorizedRetry::default();
+        loop {
+            let client_setup = self
+                .client
+                .current_client_setup(ClientRouting::Workspace)
+                .await?;
+            let include_internal = self
+                .client
+                .state
+                .provider
+                .include_internal_metadata(&client_setup.api_provider);
+            let responses_headers = self
+                .client
+                .responses_headers(client_setup.auth.as_ref(), &model_info.slug);
+            tracing::Span::current().record("api.path", "/responses");
+            let request_auth_context = AuthRequestTelemetryContext::new(
+                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                client_setup.api_auth.as_ref(),
+                client_setup.agent_identity_telemetry.clone(),
+                pending_retry,
+            );
+            let mut request = self.client.build_responses_request(
+                prompt,
+                model_info,
+                effort.clone(),
+                summary,
+                service_tier.clone(),
+                responses_metadata,
+                include_internal,
+            )?;
+            if is_guardian_reviewer(&responses_headers) {
+                request.service_tier = None;
+            }
+            request.access_programs = cyber_access_program::for_auth(
+                client_setup.auth.as_ref(),
+                prompt.cyber_access_program,
+            );
+            let mut websocket_metadata = responses_metadata.clone();
+            websocket_metadata.routing_hint = self.client.build_routing_hint_header(
+                client_setup.auth.as_ref(),
+                &responses_headers,
+                &request.model,
+                request.service_tier.as_deref(),
+            );
+            let request_session_telemetry = if warmup {
+                // `generate=false` prewarm is connection setup, not an inference request.
+                session_telemetry.clone()
+            } else {
+                session_telemetry_for_request(session_telemetry, &request)
+            };
+            match self
+                .websocket_connection(WebsocketConnectParams {
+                    session_telemetry,
+                    api_provider: client_setup.api_provider,
+                    auth_revision: client_setup.auth_revision,
+                    api_auth: client_setup.api_auth,
+                    auth_owner_generation: client_setup.auth_owner_generation,
+                    responses_metadata: &websocket_metadata,
+                    auth_context: request_auth_context,
+                    request_route_telemetry: RequestRouteTelemetry::for_endpoint("/responses"),
+                    responses_headers: &responses_headers,
+                })
+                .await
+            {
+                Ok(_) => {}
+                Err(ApiError::Transport(TransportError::Http { status, .. }))
+                    if status == StatusCode::UPGRADE_REQUIRED =>
+                {
+                    return Ok(WebsocketStreamOutcome::FallbackToHttp);
+                }
+                Err(ApiError::Transport(unauthorized_transport))
+                    if provider.is_recoverable_auth_error(&unauthorized_transport) =>
+                {
+                    pending_retry = PendingUnauthorizedRetry::from_recovery(
+                        handle_unauthorized(
+                            unauthorized_transport,
+                            &mut auth_recovery,
+                            &mut provider_auth_recovery_attempted,
+                            session_telemetry,
+                            &provider,
+                            self.client.event_sender.as_ref(),
+                            responses_metadata.turn_id.as_deref(),
+                        )
+                        .await?,
+                    );
+                    continue;
+                }
+                Err(err) => return Err(provider.map_api_error(err)),
+            }
+
+            // Measure the complete logical request, not only the websocket delta.
+            if !warmup
+                && crate::guardian::is_basic_session_source(&self.client.state.session_source)
+            {
+                crate::guardian::observe_guardian_request(session_telemetry, &request);
+            }
+            let mut client_metadata = self.client.build_ws_client_metadata(
+                responses_metadata,
+                include_internal,
+                model_info.use_responses_lite,
+            );
+            if let Some(turn_state) = self.turn_state.get() {
+                client_metadata.insert(X_CODEX_TURN_STATE_HEADER.to_string(), turn_state.clone());
+            }
+            let continuation = self.prepare_websocket_request(&request);
+            let (mode, reason) = if continuation.is_some() {
+                ("incremental", "incremental")
+            } else {
+                let reason = self
+                    .websocket_session
+                    .continuation_reset_reason
+                    .take()
+                    .unwrap_or(if self.websocket_session.last_request.is_some() {
+                        "other"
+                    } else if self.client.restored_history {
+                        "restored_history"
+                    } else {
+                        "no_previous_request"
+                    });
+                ("full", reason)
+            };
+            let previous_response_id_from_untraced_warmup = continuation
+                .as_ref()
+                .is_some_and(|c| c.from_untraced_warmup);
+            let inference_trace_attempt = if warmup {
+                // Prewarm sends `generate=false`; it is connection setup, not a
+                // model inference attempt that should appear in rollout traces.
+                InferenceTraceAttempt::disabled()
+            } else {
+                inference_trace.start_attempt()
+            };
+            if previous_response_id_from_untraced_warmup {
+                // The transport can reuse an untraced warmup response id and omit the
+                // already-sent input, but rollout replay needs the logical model-visible
+                // request rather than the compressed websocket delta.
+                inference_trace_attempt.record_started(&request);
+            }
+
+            let (previous_response_id, mut incremental_items) = match continuation {
+                Some(continuation) => (Some(continuation.response_id), Some(continuation.items)),
+                None => (None, None),
+            };
+            let original_item_ids = if let Some(incremental_items) = &mut incremental_items {
+                self.client
+                    .prepare_response_items_for_request(incremental_items);
+                None
+            } else {
+                let original_item_ids = request
+                    .input
+                    .iter()
+                    .map(|item| item.id().cloned())
+                    .collect::<Vec<_>>();
+                self.client
+                    .prepare_response_items_for_request(&mut request.input);
+                Some(original_item_ids)
+            };
+            let mut ws_payload = ResponseCreateWsRequest {
+                previous_response_id,
+                input: incremental_items.as_deref().unwrap_or(&request.input),
+                generate: if warmup { Some(false) } else { None },
+                client_metadata: response_create_client_metadata(
+                    Some(client_metadata),
+                    request_trace.as_ref(),
+                ),
+                ..ResponseCreateWsRequest::from(&request)
+            };
+            self.client.set_guardian_metadata(
+                &mut ws_payload.client_metadata,
+                responses_metadata.parent_response_id.as_deref(),
+                client_setup.auth.as_ref(),
+                &responses_headers,
+            );
+            let interceptors = crate::model_request::prepare(
+                &self.client.request_contributors,
+                &self.client.state.thread_id.to_string(),
+                &model_info.slug,
+                if warmup {
+                    codex_extension_api::ModelRequestKind::Warmup
+                } else {
+                    codex_extension_api::ModelRequestKind::Generation
+                },
+                &mut ws_payload.client_metadata,
+            );
+            let mut ws_request = ResponsesWsRequest::ResponseCreate(ws_payload);
+            stamp_ws_stream_request_start_ms(&mut ws_request);
+            let ResponsesWsRequest::ResponseCreate(payload) = &ws_request;
+            let bounded_input = tool_metadata::bounded_input(&ws_request, payload.input);
+            if let Some(input) = bounded_input.as_deref() {
+                if let Some(recorder) = &self.client.executed_tool_calls {
+                    recorder.invalidate_wire_inventory_loss(payload.input, input);
+                }
+                let ResponsesWsRequest::ResponseCreate(payload) = &mut ws_request;
+                payload.input = input;
+            }
+            if !previous_response_id_from_untraced_warmup {
+                inference_trace_attempt.record_started(&ws_request);
+            }
+
+            let websocket_connection =
+                self.websocket_session.connection.as_ref().ok_or_else(|| {
+                    self.client.state.provider.map_api_error(ApiError::Stream(
+                        "websocket connection is unavailable".to_string(),
+                    ))
+                })?;
+            request_session_telemetry.counter(
+                WEBSOCKET_CONTINUATION_COUNT_METRIC,
+                /*inc*/ 1,
+                &[
+                    ("mode", mode),
+                    ("reason", reason),
+                    ("phase", if warmup { "warmup" } else { "generation" }),
+                    (
+                        "after_prewarm",
+                        if after_prewarm { "true" } else { "false" },
+                    ),
+                ],
+            );
+            let stream_result = websocket_connection
+                .stream_request(
+                    ws_request,
+                    self.websocket_session.connection_reused(),
+                    Some(Arc::clone(&self.turn_state)),
+                )
+                .await;
+            if let Some(original_item_ids) = original_item_ids {
+                for (item, original_item_id) in request.input.iter_mut().zip(original_item_ids) {
+                    item.set_id(original_item_id);
+                }
+            }
+            self.websocket_session.last_request = Some(request);
+            self.websocket_session.last_response_from_untraced_warmup = warmup;
+            let stream_result = stream_result.map_err(|err| {
+                let response_debug_context = extract_response_debug_context_from_api_error(&err);
+                let err = self.client.state.provider.map_api_error(err);
+                inference_trace_attempt.record_failed(
+                    &err,
+                    response_debug_context.request_id.as_deref(),
+                    /*output_items*/ &[],
+                );
+                err
+            })?;
+            let (stream, last_request_rx) = map_response_stream(
+                stream_result,
+                request_session_telemetry,
+                inference_trace_attempt,
+                Arc::clone(&self.client.state.provider),
+                interceptors,
+            );
+            self.websocket_session.last_response_rx = Some(last_request_rx);
+            return Ok(WebsocketStreamOutcome::Stream(stream));
+        }
+    }
+
+    /// Builds request and SSE telemetry for streaming API calls.
+    fn build_streaming_telemetry(
+        session_telemetry: &SessionTelemetry,
+        auth_context: AuthRequestTelemetryContext,
+        request_route_telemetry: RequestRouteTelemetry,
+        auth_env_telemetry: AuthEnvTelemetry,
+    ) -> (Arc<dyn RequestTelemetry>, Arc<dyn SseTelemetry>) {
+        let telemetry = Arc::new(ApiTelemetry::new(
+            session_telemetry.clone(),
+            auth_context,
+            request_route_telemetry,
+            auth_env_telemetry,
+        ));
+        let request_telemetry: Arc<dyn RequestTelemetry> = telemetry.clone();
+        let sse_telemetry: Arc<dyn SseTelemetry> = telemetry;
+        (request_telemetry, sse_telemetry)
+    }
+
+    /// Builds telemetry for the Responses API WebSocket transport.
+    fn build_websocket_telemetry(
+        session_telemetry: &SessionTelemetry,
+        auth_context: AuthRequestTelemetryContext,
+        request_route_telemetry: RequestRouteTelemetry,
+        auth_env_telemetry: AuthEnvTelemetry,
+    ) -> Arc<dyn WebsocketTelemetry> {
+        let telemetry = Arc::new(ApiTelemetry::new(
+            session_telemetry.clone(),
+            auth_context,
+            request_route_telemetry,
+            auth_env_telemetry,
+        ));
+        let websocket_telemetry: Arc<dyn WebsocketTelemetry> = telemetry;
+        websocket_telemetry
+    }
+
+    /// Whether a previous request prepared a connection that is not known to be closed.
+    /// The next request still validates provider, auth, and headers before reuse.
+    pub(crate) async fn is_websocket_prewarmed(&self) -> bool {
+        if self.websocket_session.last_request.is_some()
+            && let Some(connection) = self.websocket_session.connection.as_ref()
+        {
+            !connection.is_closed().await
+        } else {
+            false
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prewarm_websocket(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+    ) -> Result<()> {
+        if !self.client.responses_websocket_enabled() {
+            return Ok(());
+        }
+        if self.is_websocket_prewarmed().await {
+            return Ok(());
+        }
+
+        let disabled_trace = InferenceTraceContext::disabled();
+        match self
+            .stream_responses_websocket(
+                prompt,
+                model_info,
+                session_telemetry,
+                effort,
+                summary,
+                service_tier,
+                responses_metadata,
+                /*warmup*/ true,
+                current_span_w3c_trace_context(),
+                &disabled_trace,
+            )
+            .await
+        {
+            Ok(WebsocketStreamOutcome::Stream(mut stream)) => {
+                // Wait for the v2 warmup request to complete before sending the first turn request.
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Ok(ResponseEvent::Completed { .. }) => break,
+                        Err(err) => return Err(err),
+                        _ => {}
+                    }
+                }
+                Ok(())
+            }
+            Ok(WebsocketStreamOutcome::FallbackToHttp) => {
+                self.try_switch_fallback_transport(session_telemetry, model_info);
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Streams a single model request within the current turn.
+    ///
+    /// The caller is responsible for passing per-turn settings explicitly (model selection,
+    /// reasoning settings, telemetry context, and turn metadata). This method will prefer the
+    /// Responses WebSocket transport when the provider supports it and it remains healthy, and will
+    /// fall back to the HTTP Responses API transport otherwise. The trace context may be enabled or
+    /// disabled, but is always explicit so transport paths do not need separate trace/no-trace
+    /// branches.
+    pub async fn stream(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+        inference_trace: &InferenceTraceContext,
+    ) -> Result<ResponseStream> {
+        let wire_api = self.client.state.provider.info().wire_api;
+        match wire_api {
+            WireApi::Responses => {
+                if self.client.responses_websocket_enabled() {
+                    let request_trace = current_span_w3c_trace_context();
+                    match self
+                        .stream_responses_websocket(
+                            prompt,
+                            model_info,
+                            session_telemetry,
+                            effort.clone(),
+                            summary,
+                            service_tier.clone(),
+                            responses_metadata,
+                            /*warmup*/ false,
+                            request_trace,
+                            inference_trace,
+                        )
+                        .await?
+                    {
+                        WebsocketStreamOutcome::Stream(stream) => return Ok(stream),
+                        WebsocketStreamOutcome::FallbackToHttp => {
+                            self.try_switch_fallback_transport(session_telemetry, model_info);
+                        }
+                    }
+                }
+
+                self.stream_responses_api(
+                    prompt,
+                    model_info,
+                    session_telemetry,
+                    effort,
+                    summary,
+                    service_tier,
+                    responses_metadata,
+                    inference_trace,
+                )
+                .await
+            }
+            WireApi::Chat => {
+                self.stream_chat_completions_api(
+                    prompt,
+                    model_info,
+                    session_telemetry,
+                    effort,
+                    summary,
+                    service_tier,
+                    responses_metadata,
+                    inference_trace,
+                )
+                .await
+            }
+            WireApi::Anthropic => {
+                self.stream_anthropic_api(prompt, model_info, session_telemetry, inference_trace)
+                    .await
+            }
+        }
+    }
+
+    /// Permanently disables WebSockets for this Codex session and resets WebSocket state.
+    ///
+    /// This is used after exhausting the provider retry budget, to force subsequent requests onto
+    /// the HTTP transport.
+    ///
+    /// Returns `true` if this call activated fallback, or `false` if fallback was already active.
+    pub(crate) fn try_switch_fallback_transport(
+        &mut self,
+        session_telemetry: &SessionTelemetry,
+        model_info: &ModelInfo,
+    ) -> bool {
+        let activated = self
+            .client
+            .force_http_fallback(session_telemetry, model_info);
+        self.websocket_session = WebsocketSession::default();
+        activated
+    }
+
+    /// Streams a turn via the OpenAI Chat Completions API.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(
+        name = "model_client.stream_chat_completions_api",
+        level = "info",
+        skip_all,
+        fields(
+            model = %model_info.slug,
+            wire_api = %self.client.state.provider.info().wire_api,
+            transport = "chat_completions_http",
+            http.method = "POST",
+            api.path = "chat/completions"
+        )
+    )]
+    async fn stream_chat_completions_api(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        _summary: ReasoningSummaryConfig,
+        _service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+        inference_trace: &InferenceTraceContext,
+    ) -> Result<ResponseStream> {
+        let auth_manager = self.client.state.provider.auth_manager();
+        let mut auth_recovery = auth_manager
+            .as_ref()
+            .map(AuthManager::unauthorized_recovery);
+        let mut provider_auth_recovery_attempted = false;
+        let mut pending_retry = PendingUnauthorizedRetry::default();
+        let mut retry_count: u32 = 0;
+        let mut auth_retry_count: u32 = 0;
+        const MAX_AUTH_RETRIES: u32 = 10;
+        let base_delay = Duration::from_secs(5);
+        let max_delay = Duration::from_secs(600); // 10 minutes
+        loop {
+            let client_setup = self
+                .client
+                .current_client_setup(ClientRouting::Workspace)
+                .await?;
+            let transport = self.client.build_api_transport(
+                &client_setup.api_provider,
+                "/chat/completions",
+                client_setup.redirect_policy,
+            )?;
+            let request_auth_context = AuthRequestTelemetryContext::new(
+                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                client_setup.api_auth.as_ref(),
+                client_setup.agent_identity_telemetry.clone(),
+                pending_retry,
+            );
+            let (_, _sse_telemetry) = Self::build_streaming_telemetry(
+                session_telemetry,
+                request_auth_context,
+                RequestRouteTelemetry::for_endpoint("/chat/completions"),
+                self.client.state.auth_env_telemetry.clone(),
+            );
+
+            let request = self.build_chat_completions_request(
+                prompt,
+                model_info,
+                effort.clone(),
+                &responses_metadata.session_id,
+            )?;
+            let inference_trace_attempt = inference_trace.start_attempt();
+            inference_trace_attempt.record_started(&request);
+            let chat_stream = self.client.state.provider.info().chat_stream;
+            let client = ApiChatCompletionsClient::new(
+                transport,
+                client_setup.api_provider,
+                client_setup.api_auth,
+                chat_stream,
+            );
+            let mut extra_headers = ApiHeaderMap::new();
+            let session_header_value = HeaderValue::from_str(&responses_metadata.session_id)
+                .map_err(|err| {
+                    CodexErr::InvalidRequest(format!("invalid Codex session ID header: {err}"))
+                })?;
+            extra_headers.insert(X_SESSION_AFFINITY_HEADER, session_header_value.clone());
+            extra_headers.insert(X_SESSION_ID_HEADER, session_header_value);
+            // Only the compaction-window identity is forwarded here. The rest of the Responses
+            // compatibility metadata stays off this path because `WireApi::Chat` providers are
+            // frequently third parties.
+            let window_header_value = HeaderValue::from_str(&responses_metadata.window_id)
+                .map_err(|err| {
+                    CodexErr::InvalidRequest(format!("invalid Codex window ID header: {err}"))
+                })?;
+            extra_headers.insert(X_CODEX_WINDOW_ID_HEADER, window_header_value);
+            if let Some(parent_thread_id) = responses_metadata.parent_thread_id {
+                let parent_header_value = HeaderValue::from_str(&parent_thread_id.to_string())
+                    .map_err(|err| {
+                        CodexErr::InvalidRequest(format!(
+                            "invalid Codex parent session ID header: {err}"
+                        ))
+                    })?;
+                extra_headers.insert(X_PARENT_SESSION_ID_HEADER, parent_header_value);
+            }
+            let stream_result = client.request(request, extra_headers).await;
+
+            match stream_result {
+                Ok(stream) => {
+                    let (stream, _) = map_response_stream(
+                        stream,
+                        session_telemetry.clone(),
+                        inference_trace_attempt,
+                        Arc::clone(&self.client.state.provider),
+                        Vec::new(),
+                    );
+                    return Ok(stream);
+                }
+                Err(ApiError::Transport(
+                    unauthorized_transport @ TransportError::Http { status, .. },
+                )) if status == StatusCode::UNAUTHORIZED => {
+                    inference_trace_attempt.record_failed(
+                        &unauthorized_transport,
+                        /*upstream_request_id*/ None,
+                        /*output_items*/ &[],
+                    );
+                    match handle_unauthorized(
+                        unauthorized_transport,
+                        &mut auth_recovery,
+                        &mut provider_auth_recovery_attempted,
+                        session_telemetry,
+                        &self.client.state.provider,
+                        self.client.event_sender.as_ref(),
+                        responses_metadata.turn_id.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(recovery) => {
+                            pending_retry = PendingUnauthorizedRetry::from_recovery(recovery);
+                            retry_count = 0;
+                            auth_retry_count = 0;
+                            continue;
+                        }
+                        Err(err) => {
+                            // Custom API providers can't refresh tokens, but 401s
+                            // may be transient. Retry with backoff up to 10 times.
+                            if auth_retry_count < MAX_AUTH_RETRIES {
+                                let delay = base_delay
+                                    .saturating_mul(
+                                        1u32.checked_shl(auth_retry_count.min(20))
+                                            .unwrap_or(u32::MAX),
+                                    )
+                                    .min(max_delay);
+                                warn!(
+                                    auth_retry_count,
+                                    delay_ms = delay.as_millis(),
+                                    "Chat Completions received 401, retrying after backoff"
+                                );
+                                self.notify_stream_retry(
+                                    format!(
+                                        "Retrying... (attempt {}) — HTTP 401",
+                                        auth_retry_count + 1
+                                    ),
+                                    err.to_string(),
+                                    Some(401),
+                                );
+                                sleep(delay).await;
+                                auth_retry_count += 1;
+                                continue;
+                            }
+                            return Err(err);
+                        }
+                    }
+                }
+                Err(err) => {
+                    inference_trace_attempt.record_failed(
+                        &err,
+                        /*upstream_request_id*/ None,
+                        /*output_items*/ &[],
+                    );
+                    let delay = match &err {
+                        ApiError::Retryable {
+                            retry_after: Some(d),
+                            ..
+                        } => d.remaining_delay(),
+                        _ => {
+                            // Exponential backoff: 5s, 10s, 20s, 40s, ..., capped at 10 min
+                            let multiplier =
+                                1u32.checked_shl(retry_count.min(20)).unwrap_or(u32::MAX);
+                            let base = base_delay.saturating_mul(multiplier);
+                            std::cmp::min(base, max_delay)
+                        }
+                    };
+                    warn!(
+                        retry_count,
+                        delay_ms = delay.as_millis(),
+                        error = %err,
+                        "Chat Completions request failed, retrying after backoff"
+                    );
+                    self.notify_stream_retry(
+                        format!(
+                            "Retrying... (attempt {}) — {}",
+                            retry_count + 1,
+                            api_error_code(&err)
+                        ),
+                        err.to_string(),
+                        api_error_http_status(&err),
+                    );
+                    sleep(delay).await;
+                    retry_count += 1;
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Streams a turn via the Anthropic Messages API.
+    #[instrument(
+        name = "model_client.stream_anthropic_api",
+        level = "info",
+        skip_all,
+        fields(
+            model = %model_info.slug,
+            wire_api = %self.client.state.provider.info().wire_api,
+            transport = "anthropic_http",
+            http.method = "POST",
+            api.path = "v1/messages"
+        )
+    )]
+    async fn stream_anthropic_api(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        inference_trace: &InferenceTraceContext,
+    ) -> Result<ResponseStream> {
+        let auth_manager = self.client.state.provider.auth_manager();
+        let mut auth_recovery = auth_manager
+            .as_ref()
+            .map(AuthManager::unauthorized_recovery);
+        let mut provider_auth_recovery_attempted = false;
+        let mut pending_retry = PendingUnauthorizedRetry::default();
+        let mut retry_count: u32 = 0;
+        let mut auth_retry_count: u32 = 0;
+        const MAX_AUTH_RETRIES: u32 = 10;
+        let base_delay = Duration::from_secs(5);
+        let max_delay = Duration::from_secs(600);
+        loop {
+            let client_setup = self
+                .client
+                .current_client_setup(ClientRouting::Workspace)
+                .await?;
+            let transport = self.client.build_api_transport(
+                &client_setup.api_provider,
+                "/v1/messages",
+                client_setup.redirect_policy,
+            )?;
+            let request_auth_context = AuthRequestTelemetryContext::new(
+                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                client_setup.api_auth.as_ref(),
+                client_setup.agent_identity_telemetry.clone(),
+                pending_retry,
+            );
+            let (_, _sse_telemetry) = Self::build_streaming_telemetry(
+                session_telemetry,
+                request_auth_context,
+                RequestRouteTelemetry::for_endpoint("/v1/messages"),
+                self.client.state.auth_env_telemetry.clone(),
+            );
+
+            let own_agent_path = self
+                .client
+                .state
+                .session_source
+                .get_agent_path()
+                .unwrap_or_else(codex_protocol::AgentPath::root)
+                .to_string();
+            let request = crate::client_anthropic::build_anthropic_request_with_agent_path(
+                prompt,
+                model_info,
+                &own_agent_path,
+            )?;
+            let inference_trace_attempt = inference_trace.start_attempt();
+            inference_trace_attempt.record_started(&request);
+            let chat_stream = self.client.state.provider.info().chat_stream;
+            let client = ApiAnthropicClient::new(
+                transport,
+                client_setup.api_provider,
+                client_setup.api_auth,
+                chat_stream,
+            );
+            let stream_result = client.request(request, ApiHeaderMap::new()).await;
+
+            match stream_result {
+                Ok(stream) => {
+                    let (stream, _) = map_response_stream(
+                        stream,
+                        session_telemetry.clone(),
+                        inference_trace_attempt,
+                        Arc::clone(&self.client.state.provider),
+                        Vec::new(),
+                    );
+                    return Ok(stream);
+                }
+                Err(ApiError::Transport(
+                    unauthorized_transport @ TransportError::Http { status, .. },
+                )) if status == StatusCode::UNAUTHORIZED => {
+                    inference_trace_attempt.record_failed(
+                        &unauthorized_transport,
+                        /*upstream_request_id*/ None,
+                        /*output_items*/ &[],
+                    );
+                    match handle_unauthorized(
+                        unauthorized_transport,
+                        &mut auth_recovery,
+                        &mut provider_auth_recovery_attempted,
+                        session_telemetry,
+                        &self.client.state.provider,
+                        self.client.event_sender.as_ref(),
+                        /*turn_id*/ None,
+                    )
+                    .await
+                    {
+                        Ok(recovery) => {
+                            pending_retry = PendingUnauthorizedRetry::from_recovery(recovery);
+                            retry_count = 0;
+                            auth_retry_count = 0;
+                            continue;
+                        }
+                        Err(err) => {
+                            if auth_retry_count < MAX_AUTH_RETRIES {
+                                let delay = base_delay
+                                    .saturating_mul(
+                                        1u32.checked_shl(auth_retry_count.min(20))
+                                            .unwrap_or(u32::MAX),
+                                    )
+                                    .min(max_delay);
+                                warn!(
+                                    auth_retry_count,
+                                    delay_ms = delay.as_millis(),
+                                    "Anthropic received 401, retrying after backoff"
+                                );
+                                self.notify_stream_retry(
+                                    format!(
+                                        "Retrying... (attempt {}) — HTTP 401",
+                                        auth_retry_count + 1
+                                    ),
+                                    err.to_string(),
+                                    Some(401),
+                                );
+                                sleep(delay).await;
+                                auth_retry_count += 1;
+                                continue;
+                            }
+                            return Err(err);
+                        }
+                    }
+                }
+                Err(err) => {
+                    inference_trace_attempt.record_failed(
+                        &err,
+                        /*upstream_request_id*/ None,
+                        /*output_items*/ &[],
+                    );
+                    let delay = match &err {
+                        ApiError::Retryable {
+                            retry_after: Some(d),
+                            ..
+                        } => d.remaining_delay(),
+                        _ => {
+                            let multiplier =
+                                1u32.checked_shl(retry_count.min(20)).unwrap_or(u32::MAX);
+                            let base = base_delay.saturating_mul(multiplier);
+                            std::cmp::min(base, max_delay)
+                        }
+                    };
+                    warn!(
+                        retry_count,
+                        delay_ms = delay.as_millis(),
+                        error = %err,
+                        "Anthropic request failed, retrying after backoff"
+                    );
+                    self.notify_stream_retry(
+                        format!(
+                            "Retrying... (attempt {}) — {}",
+                            retry_count + 1,
+                            api_error_code(&err)
+                        ),
+                        err.to_string(),
+                        api_error_http_status(&err),
+                    );
+                    sleep(delay).await;
+                    retry_count += 1;
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Builds a ChatCompletionsRequest from a Prompt.
+    fn build_chat_completions_request(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        effort: Option<ReasoningEffortConfig>,
+        session_id: &str,
+    ) -> Result<ChatCompletionsRequest> {
+        let instructions = &prompt.base_instructions.text;
+        let input = prompt.get_formatted_input_for_request(model_info);
+
+        // Convert instructions to a system message
+        let mut messages = Vec::new();
+        if !instructions.is_empty() {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(serde_json::Value::String(instructions.clone())),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+        }
+
+        // Convert ResponseItems to ChatMessages
+        // First pass: collect reasoning content by anchor index.
+        // Read from `summary` first: the fork's chat-completions provider puts
+        // the full reasoning text there (mirroring the upstream Responses API
+        // summary path) so codex-acp's seen_reasoning_deltas dedup suppresses
+        // the duplicate complete-reasoning event. Fall back to `content` for
+        // legacy reasoning items that still carry text there.
+        let mut reasoning_by_index: HashMap<usize, String> = HashMap::new();
+        for (idx, item) in input.iter().enumerate() {
+            if let ResponseItem::Reasoning {
+                summary, content, ..
+            } = item
+            {
+                let mut text = String::new();
+                for entry in summary {
+                    let codex_protocol::models::ReasoningItemReasoningSummary::SummaryText {
+                        text: segment,
+                    } = entry;
+                    text.push_str(segment);
+                }
+                if text.trim().is_empty()
+                    && let Some(items) = content
+                {
+                    for entry in items {
+                        match entry {
+                            codex_protocol::models::ReasoningItemContent::ReasoningText {
+                                text: segment,
+                            }
+                            | codex_protocol::models::ReasoningItemContent::Text {
+                                text: segment,
+                            } => text.push_str(segment),
+                        }
+                    }
+                }
+                if !text.trim().is_empty() {
+                    // Attach reasoning to the next assistant output in this turn.
+                    // In thinking mode (e.g., DeepSeek), reasoning precedes the
+                    // assistant's content or tool calls, so it should be attached
+                    // to the *next* relevant item (Message with role=assistant or
+                    // FunctionCall), not a previous assistant message from an
+                    // earlier turn.
+                    for (next_idx, next_item) in input.iter().enumerate().skip(idx + 1) {
+                        match next_item {
+                            ResponseItem::Message { role, .. } if role == "assistant" => {
+                                reasoning_by_index
+                                    .entry(next_idx)
+                                    .and_modify(|v| {
+                                        v.push('\n');
+                                        v.push_str(&text)
+                                    })
+                                    .or_insert(text.clone());
+                                break;
+                            }
+                            ResponseItem::FunctionCall { .. } => {
+                                reasoning_by_index
+                                    .entry(next_idx)
+                                    .and_modify(|v| {
+                                        v.push('\n');
+                                        v.push_str(&text)
+                                    })
+                                    .or_insert(text.clone());
+                                break;
+                            }
+                            // Stop searching if we hit a non-assistant boundary
+                            ResponseItem::Message { role, .. } if role != "assistant" => break,
+                            ResponseItem::FunctionCallOutput { .. } => break,
+                            ResponseItem::CustomToolCallOutput { .. } => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        // Second pass: build messages with reasoning attached.
+        // Consecutive assistant-turn items (Message with role=assistant, FunctionCall,
+        // CustomToolCall, Reasoning) must be merged into a single ChatMessage because
+        // the Chat Completions API requires all tool_calls and content from one
+        // assistant turn to appear on the same message, with tool results immediately
+        // following. If we emit separate messages for text and tool_calls, providers
+        // that validate message ordering will reject the request with a 400 error.
+        let mut pending_assistant: Option<ChatMessage> = None;
+        // Warning messages are recorded before the tool result they describe.
+        // Queue them until the current assistant tool-result block is complete,
+        // or we reach a non-tool boundary.
+        let mut pending_warnings: Vec<ChatMessage> = Vec::new();
+        let mut pending_tool_image_parts: Vec<serde_json::Value> = Vec::new();
+        let mut pending_tool_outputs_in_turn = 0usize;
+        for (idx, item) in input.iter().enumerate() {
+            let reasoning = reasoning_by_index.get(&idx).cloned();
+            match item {
+                ResponseItem::Message { role, content, .. } => {
+                    let mapped_role = match role.as_str() {
+                        "developer" | "system" => "system",
+                        "assistant" => "assistant",
+                        "user" => "user",
+                        other => other,
+                    };
+                    let is_assistant = mapped_role == "assistant";
+                    let msg_content = content_items_to_chat_content(content, is_assistant);
+                    // Text-only view for Warning: detection; images never start with "Warning:".
+                    let text_only = content
+                        .iter()
+                        .filter_map(|c| match c {
+                            codex_protocol::models::ContentItem::OutputText { text, .. } => {
+                                Some(text.clone())
+                            }
+                            codex_protocol::models::ContentItem::InputText { text, .. } => {
+                                Some(text.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    if mapped_role == "assistant" {
+                        if pending_assistant.is_none()
+                            && pending_tool_outputs_in_turn == 0
+                            && !pending_warnings.is_empty()
+                        {
+                            messages.append(&mut pending_warnings);
+                        }
+                        if let Some(msg) = pending_assistant.as_mut() {
+                            // Merge content into existing pending assistant message.
+                            // This handles the case where FunctionCall items appear
+                            // before the Message item in the ResponseItem list.
+                            if let Some(c) = msg_content.clone() {
+                                msg.content = Some(c);
+                            }
+                            // Gate on the surviving `reasoning_content` field;
+                            // the redundant `reasoning` field was removed.
+                            if msg.reasoning_content.is_none() && reasoning.is_some() {
+                                msg.reasoning_content = reasoning.clone();
+                            }
+                        } else {
+                            // Start a new pending assistant message.
+                            pending_assistant = Some(ChatMessage {
+                                role: "assistant".to_string(),
+                                content: msg_content.clone(),
+                                tool_calls: None,
+                                tool_call_id: None,
+                                reasoning_content: reasoning.clone(),
+                            });
+                        }
+                    } else {
+                        if mapped_role == "user" && text_only.starts_with("Warning:") {
+                            pending_warnings.push(ChatMessage {
+                                role: "user".to_string(),
+                                content: Some(serde_json::Value::String(text_only)),
+                                tool_calls: None,
+                                tool_call_id: None,
+                                reasoning_content: None,
+                            });
+                            continue;
+                        }
+                        if let Some(msg) = pending_assistant.take() {
+                            messages.push(msg);
+                        }
+                        flush_pending_tool_images(&mut messages, &mut pending_tool_image_parts);
+                        pending_tool_outputs_in_turn = 0;
+                        if !pending_warnings.is_empty() {
+                            messages.append(&mut pending_warnings);
+                        }
+                        messages.push(ChatMessage {
+                            role: mapped_role.to_string(),
+                            content: msg_content,
+                            tool_calls: None,
+                            tool_call_id: None,
+                            reasoning_content: None,
+                        });
+                    }
+                }
+                ResponseItem::FunctionCall {
+                    name,
+                    arguments,
+                    call_id,
+                    ..
+                } => {
+                    let tool_call = codex_api::ChatToolCall {
+                        id: call_id.clone(),
+                        r#type: "function".to_string(),
+                        function: codex_api::ChatFunctionCall {
+                            name: name.clone(),
+                            arguments: Some(ensure_valid_json_arguments(name, arguments)),
+                        },
+                    };
+                    if pending_assistant.is_none()
+                        && pending_tool_outputs_in_turn == 0
+                        && !pending_warnings.is_empty()
+                    {
+                        messages.append(&mut pending_warnings);
+                    }
+                    match pending_assistant.as_mut() {
+                        Some(msg) => {
+                            // Append to existing pending assistant message.
+                            msg.tool_calls.get_or_insert_with(Vec::new).push(tool_call);
+                            // Gate on the surviving `reasoning_content` field;
+                            // the redundant `reasoning` field was removed.
+                            if msg.reasoning_content.is_none() && reasoning.is_some() {
+                                msg.reasoning_content = reasoning.clone();
+                            }
+                        }
+                        None => {
+                            // No pending assistant — start one with just this tool call.
+                            pending_assistant = Some(ChatMessage {
+                                role: "assistant".to_string(),
+                                content: None,
+                                tool_calls: Some(vec![tool_call]),
+                                tool_call_id: None,
+                                reasoning_content: reasoning.clone(),
+                            });
+                        }
+                    }
+                    pending_tool_outputs_in_turn += 1;
+                }
+                ResponseItem::CustomToolCall {
+                    call_id,
+                    name,
+                    input: tool_input,
+                    ..
+                } => {
+                    let tool_call = codex_api::ChatToolCall {
+                        id: call_id.clone(),
+                        r#type: "function".to_string(),
+                        function: codex_api::ChatFunctionCall {
+                            name: name.clone(),
+                            arguments: Some(ensure_valid_json_arguments(name, tool_input)),
+                        },
+                    };
+                    if pending_assistant.is_none()
+                        && pending_tool_outputs_in_turn == 0
+                        && !pending_warnings.is_empty()
+                    {
+                        messages.append(&mut pending_warnings);
+                    }
+                    match pending_assistant.as_mut() {
+                        Some(msg) => {
+                            msg.tool_calls.get_or_insert_with(Vec::new).push(tool_call);
+                            // Gate on the surviving `reasoning_content` field;
+                            // the redundant `reasoning` field was removed.
+                            if msg.reasoning_content.is_none() && reasoning.is_some() {
+                                msg.reasoning_content = reasoning.clone();
+                            }
+                        }
+                        None => {
+                            pending_assistant = Some(ChatMessage {
+                                role: "assistant".to_string(),
+                                content: None,
+                                tool_calls: Some(vec![tool_call]),
+                                tool_call_id: None,
+                                reasoning_content: reasoning.clone(),
+                            });
+                        }
+                    }
+                    pending_tool_outputs_in_turn += 1;
+                }
+                ResponseItem::FunctionCallOutput {
+                    call_id, output, ..
+                } => {
+                    // Tool result: flush pending assistant, then push tool message.
+                    // Images cannot go in tool-role messages (Chat Completions API only
+                    // supports string content on tool messages). Split them into a
+                    // separate user message instead.
+                    if let Some(msg) = pending_assistant.take() {
+                        messages.push(msg);
+                    }
+                    let (tool_content, user_image_content) =
+                        split_tool_output_into_tool_and_user_content(&output.body);
+                    messages.push(ChatMessage {
+                        role: "tool".to_string(),
+                        content: Some(tool_content),
+                        tool_calls: None,
+                        tool_call_id: call_id.clone(),
+                        reasoning_content: None,
+                    });
+                    if let Some(serde_json::Value::Array(image_parts)) = user_image_content {
+                        pending_tool_image_parts.extend(image_parts);
+                    }
+                    pending_tool_outputs_in_turn = pending_tool_outputs_in_turn.saturating_sub(1);
+                    if pending_tool_outputs_in_turn == 0 {
+                        flush_pending_tool_images(&mut messages, &mut pending_tool_image_parts);
+                        if !pending_warnings.is_empty() {
+                            messages.append(&mut pending_warnings);
+                        }
+                    }
+                }
+                ResponseItem::CustomToolCallOutput {
+                    call_id,
+                    name: _,
+                    output,
+                    ..
+                } => {
+                    // Tool result: flush pending assistant, then push tool message.
+                    // Images cannot go in tool-role messages (Chat Completions API only
+                    // supports string content on tool messages). Split them into a
+                    // separate user message instead.
+                    if let Some(msg) = pending_assistant.take() {
+                        messages.push(msg);
+                    }
+                    let (tool_content, user_image_content) =
+                        split_tool_output_into_tool_and_user_content(&output.body);
+                    messages.push(ChatMessage {
+                        role: "tool".to_string(),
+                        content: Some(tool_content),
+                        tool_calls: None,
+                        tool_call_id: Some(call_id.clone()),
+                        reasoning_content: None,
+                    });
+                    if let Some(serde_json::Value::Array(image_parts)) = user_image_content {
+                        pending_tool_image_parts.extend(image_parts);
+                    }
+                    pending_tool_outputs_in_turn = pending_tool_outputs_in_turn.saturating_sub(1);
+                    if pending_tool_outputs_in_turn == 0 {
+                        flush_pending_tool_images(&mut messages, &mut pending_tool_image_parts);
+                        if !pending_warnings.is_empty() {
+                            messages.append(&mut pending_warnings);
+                        }
+                    }
+                }
+                ResponseItem::AgentMessage {
+                    author, content, ..
+                } => {
+                    // The Responses API renders inter-agent messages natively, but the
+                    // Chat Completions API has no equivalent item type. Flatten the
+                    // message to plain text so the payload reaches the model instead
+                    // of being silently dropped. `EncryptedContent` is only opaque on
+                    // the wire to the OpenAI backend; locally it still holds the
+                    // payload text.
+                    let Some(text) = agent_message_text(content) else {
+                        continue;
+                    };
+                    let own_agent_path = self
+                        .client
+                        .state
+                        .session_source
+                        .get_agent_path()
+                        .unwrap_or_else(codex_protocol::AgentPath::root)
+                        .to_string();
+                    let role = agent_message_role(author, &own_agent_path);
+                    // Inter-agent messages are turn boundaries: flush any pending
+                    // assistant message and queued warnings first.
+                    if let Some(msg) = pending_assistant.take() {
+                        messages.push(msg);
+                    }
+                    flush_pending_tool_images(&mut messages, &mut pending_tool_image_parts);
+                    pending_tool_outputs_in_turn = 0;
+                    if !pending_warnings.is_empty() {
+                        messages.append(&mut pending_warnings);
+                    }
+                    messages.push(ChatMessage {
+                        role: role.to_string(),
+                        content: Some(serde_json::Value::String(text)),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    });
+                }
+                ResponseItem::Reasoning { .. } => {
+                    // Reasoning belongs to the current assistant turn, so it should not flush a
+                    // pending assistant message or pending warning queue on its own.
+                }
+                _ => {
+                    // Skip items that don't map cleanly to chat format.
+                    // Flush pending assistant before skipping unknown items.
+                    if let Some(msg) = pending_assistant.take() {
+                        messages.push(msg);
+                    }
+                    flush_pending_tool_images(&mut messages, &mut pending_tool_image_parts);
+                    pending_tool_outputs_in_turn = 0;
+                    if !pending_warnings.is_empty() {
+                        messages.append(&mut pending_warnings);
+                    }
+                }
+            }
+        }
+        // Flush any remaining pending assistant message.
+        if let Some(msg) = pending_assistant.take() {
+            messages.push(msg);
+        }
+        flush_pending_tool_images(&mut messages, &mut pending_tool_image_parts);
+        if !pending_warnings.is_empty() {
+            messages.append(&mut pending_warnings);
+        }
+
+        // Deduplicate consecutive identical tool calls to avoid 400 errors
+        // from providers like qwen3.7-max that reject repetitive tool calls.
+        let mut messages = deduplicate_consecutive_tool_calls(messages);
+
+        // DeepSeek thinking mode requires reasoning_content on ALL assistant messages
+        // when the model is in thinking mode. Even if a non-thinking model was used
+        // mid-session, switching back to DeepSeek requires reasoning_content to be
+        // present on every assistant message in the conversation history.
+        // Fill in "No reasoning required" for any assistant message missing this field.
+        for msg in &mut messages {
+            if msg.role == "assistant" && msg.reasoning_content.is_none() {
+                msg.reasoning_content = Some("No reasoning required".to_string());
+            }
+        }
+
+        // Convert tools and build namespace map for MCP tool resolution
+        let tools = create_tools_json_for_chat_completions(&prompt.tools)?;
+        let tool_namespace_map = build_tool_namespace_map(&prompt.tools);
+
+        // Check if there are tool_calls but no tools defined
+        let has_tool_calls = messages.iter().any(|m| m.tool_calls.is_some());
+        if has_tool_calls && tools.is_empty() {
+            return Err(CodexErr::InvalidRequest(
+                "Request has tool_calls but no tools defined. This will cause a 400 error from the API."
+                    .to_string(),
+            ));
+        }
+
+        let reasoning_effort = self
+            .client
+            .build_reasoning(model_info, effort, ReasoningSummaryConfig::None)
+            .effort;
+
+        let request = ChatCompletionsRequest {
+            model: model_info.slug.clone(),
+            messages,
+            tools,
+            tool_choice: Some(serde_json::Value::String("auto".to_string())),
+            stream: false,
+            // Set by the Chat Completions endpoint when it upgrades the request
+            // to SSE streaming.
+            stream_options: None,
+            temperature: None,
+            max_tokens: None,
+            stop: None,
+            reasoning_effort,
+            parallel_tool_calls: Some(prompt.parallel_tool_calls),
+            service_tier: None, // TODO: wire through from config or turn settings
+            prompt_cache_key: chat_completions_prompt_cache_key(session_id),
+            tool_namespace_map,
+        };
+        Ok(request)
+    }
+}
+
+/// Converts a slice of [`ContentItem`] into a [`serde_json::Value`] suitable for the
+/// `content` field of a Chat Completions API message.
+///
+/// - Text-only content is serialized as a plain `Value::String` (preserving existing
+///   wire format).
+/// - Content that includes at least one `InputImage` is serialized as a multipart
+///   `Value::Array` following the OpenAI Chat Completions multipart format:
+///   `[{"type":"text","text":"..."}, {"type":"image_url","image_url":{"url":"...","detail":"high"}}]`.
+///
+/// For assistant-role messages, `InputImage` items are intentionally dropped because
+/// the Chat Completions API does not support `image_url` parts in assistant messages.
+/// In that case, even if images were present, the result falls back to text-only string format.
+///
+/// Returns `None` when the content slice is empty or contains only dropped items.
+/// Deduplicates consecutive identical tool calls in the message history.
+///
+/// Some models (e.g., qwen3.7-max) reject requests with repetitive tool calls.
+/// This function detects "streaks" of identical tool calls: sequences where
+/// `assistant(tool_call A) → tool(result) → assistant(tool_call A) → tool(result) → ...`
+/// repeats without any other tool calls or user messages in between.
+///
+/// For each streak of 2+ identical calls:
+/// - Keeps the first assistant message (with its content and tool_call)
+/// - Keeps only the last tool result (with a warning prepended), rewriting
+///   its `tool_call_id` to match the first assistant's tool_call id
+/// - Removes all intermediate assistant messages and tool results
+fn deduplicate_consecutive_tool_calls(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    // First pass: find consecutive streaks
+    // A streak is a sequence of indices: [assistant_idx, result_idx, assistant_idx, result_idx, ...]
+    // where all assistant messages have the same (name, arguments) signature
+    let mut streaks: Vec<Vec<usize>> = Vec::new(); // each streak is a list of message indices
+    let mut current_streak: Vec<usize> = Vec::new();
+    let mut current_sig: Option<String> = None;
+
+    let mut i = 0;
+    while i < messages.len() {
+        let msg = &messages[i];
+
+        if msg.role == "assistant"
+            && let Some(tcs) = &msg.tool_calls
+            && tcs.len() == 1
+        {
+            let sig = format!(
+                "{}:{}",
+                tcs[0].function.name,
+                tcs[0].function.arguments.as_deref().unwrap_or("")
+            );
+
+            if current_sig.as_deref() == Some(&sig) {
+                // Continue the streak: add this assistant
+                current_streak.push(i);
+                // Look for the corresponding tool result
+                if i + 1 < messages.len() && messages[i + 1].role == "tool" {
+                    current_streak.push(i + 1);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            } else {
+                // New signature - save old streak if it has 2+ calls
+                if current_streak.len() >= 4 {
+                    // At least 2 assistant + 2 results = 4 messages
+                    streaks.push(current_streak.clone());
+                }
+                // Start new streak
+                current_streak = vec![i];
+                current_sig = Some(sig);
+                if i + 1 < messages.len() && messages[i + 1].role == "tool" {
+                    current_streak.push(i + 1);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        // If we get here, the streak is broken
+        if current_streak.len() >= 4 {
+            streaks.push(current_streak.clone());
+        }
+        current_streak.clear();
+        current_sig = None;
+
+        // Handle the current message
+        if msg.role == "tool" {
+            // Tool result without a preceding assistant in the streak
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    // Don't forget the last streak
+    if current_streak.len() >= 4 {
+        streaks.push(current_streak);
+    }
+
+    // If no streaks found, return as-is
+    if streaks.is_empty() {
+        return messages;
+    }
+
+    // Second pass: build result, applying deduplication
+    let mut skip_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut result_modifications: HashMap<usize, (String, usize, String)> = HashMap::new();
+
+    for streak in &streaks {
+        // streak format: [asst1, res1, asst2, res2, ...]
+        // Keep: first assistant (with its tool_call), last result (with warning
+        // and tool_call_id rewritten to match the first assistant's tool_call id)
+        // Skip: everything else in the streak
+
+        let call_count = streak.len() / 2; // number of assistant calls
+        let last_result_idx = streak[streak.len() - 1];
+        let first_asst_idx = streak[0];
+
+        // Skip all assistant messages except the first
+        for j in (2..streak.len()).step_by(2) {
+            skip_indices.insert(streak[j]);
+        }
+
+        // Skip all tool results except the last
+        for j in (1..streak.len() - 1).step_by(2) {
+            skip_indices.insert(streak[j]);
+        }
+
+        // Get the function name and tool_call id from the first assistant.
+        // The first assistant is kept as-is (including its tool_call id), so
+        // the surviving tool result must be rewritten to reference that id.
+        // Otherwise the API rejects the request with a tool_call_id mismatch.
+        let (fn_name, first_call_id) =
+            if let Some(tcs) = messages[first_asst_idx].tool_calls.as_ref() {
+                (tcs[0].function.name.clone(), tcs[0].id.clone())
+            } else {
+                ("unknown".to_string(), String::new())
+            };
+
+        // Mark the last result for modification
+        result_modifications.insert(last_result_idx, (fn_name, call_count, first_call_id));
+
+        tracing::info!(
+            "Deduplicating {} consecutive identical tool calls: {} (msg[{}..{}])",
+            call_count,
+            if let Some(tcs) = messages[first_asst_idx].tool_calls.as_ref() {
+                &tcs[0].function.name
+            } else {
+                "unknown"
+            },
+            streak[0],
+            streak[streak.len() - 1]
+        );
+    }
+
+    // Third pass: build the output
+    let mut result: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+
+    for (i, mut msg) in messages.into_iter().enumerate() {
+        if skip_indices.contains(&i) {
+            continue;
+        }
+
+        // Modify the last tool result: prepend warning and rewrite
+        // tool_call_id to match the first assistant's tool_call id so the
+        // kept assistant message and tool result stay consistent.
+        if let Some((fn_name, count, first_call_id)) = result_modifications.get(&i)
+            && let Some(content) = msg.content.as_mut()
+        {
+            // Rewrite tool_call_id to match the surviving (first) assistant.
+            msg.tool_call_id = Some(first_call_id.clone());
+            let original = match content {
+                serde_json::Value::String(s) => s.clone(),
+                ref other => other.to_string(),
+            };
+
+            let warning = format!(
+                "[WARNING: {count} consecutive identical tool calls to '{fn_name}'                     were detected and deduplicated. You were stuck in a loop calling                     '{fn_name}' with the same arguments. Consider using a different approach                     or checking if the operation is still needed.]
+
+"
+            );
+
+            *content = serde_json::Value::String(warning + &original);
+        }
+
+        result.push(msg);
+    }
+
+    result
+}
+
+/// Maps an image detail to the wire values accepted by the Chat Completions
+/// API. The Chat Completions endpoint only accepts `auto`, `low`, and `high`;
+/// `original` is a Responses API-only value, so it is downgraded to `high`,
+/// matching the behavior of `sanitize_original_image_detail`.
+fn chat_completions_image_detail(detail: codex_protocol::models::ImageDetail) -> &'static str {
+    match detail {
+        codex_protocol::models::ImageDetail::Auto => "auto",
+        codex_protocol::models::ImageDetail::Low => "low",
+        codex_protocol::models::ImageDetail::High => "high",
+        codex_protocol::models::ImageDetail::Original => "high",
+    }
+}
+
+fn content_items_to_chat_content(
+    content: &[codex_protocol::models::ContentItem],
+    is_assistant: bool,
+) -> Option<serde_json::Value> {
+    if content.is_empty() {
+        return None;
+    }
+
+    let mut has_image = false;
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut multipart_parts: Vec<serde_json::Value> = Vec::new();
+
+    for item in content {
+        match item {
+            codex_protocol::models::ContentItem::InputText { text }
+            | codex_protocol::models::ContentItem::OutputText { text } => {
+                text_parts.push(text.clone());
+                multipart_parts.push(serde_json::json!({"type": "text", "text": text.clone()}));
+            }
+            codex_protocol::models::ContentItem::InputImage { image, detail } => {
+                if is_assistant {
+                    // Assistant messages in the Chat Completions API only support text
+                    // content parts; drop image items rather than erroring.
+                    continue;
+                }
+                let codex_protocol::models::ImageReference::Inline { image_url } = image else {
+                    // File references cannot be represented as Chat Completions image
+                    // URLs; drop them rather than erroring.
+                    continue;
+                };
+                has_image = true;
+                let mut image_url_obj = serde_json::json!({"url": image_url});
+                if let Some(detail) = detail {
+                    image_url_obj["detail"] = serde_json::Value::String(
+                        chat_completions_image_detail(*detail).to_string(),
+                    );
+                }
+                multipart_parts.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": image_url_obj,
+                }));
+            }
+            codex_protocol::models::ContentItem::InputAudio { .. } => {
+                // Chat Completions API does not currently support audio inputs in this
+                // fork path; drop audio items rather than erroring.
+                continue;
+            }
+        }
+    }
+
+    if multipart_parts.is_empty() {
+        return None;
+    }
+
+    if has_image && !is_assistant {
+        Some(serde_json::Value::Array(multipart_parts))
+    } else {
+        let joined = text_parts.join("\n");
+        if joined.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::String(joined))
+        }
+    }
+}
+
+/// Splits a [`FunctionCallOutputBody`] into a text-only tool message content and,
+/// if present, a multipart user message containing any images.
+///
+/// The Chat Completions API only supports plain-string `content` on `role: "tool"`
+/// messages. Images from tool results (e.g. `view_image`) cannot be placed in the
+/// tool message itself. Instead, they must be delivered via a separate `role: "user"`
+/// message using the multipart content format:
+///
+/// ```json
+/// [{"type":"text","text":"[tool result image]"},
+///  {"type":"image_url","image_url":{"url":"data:image/png;base64,...","detail":"high"}}]
+/// ```
+///
+/// Ensures that tool call `arguments` is a valid JSON object string.
+///
+/// Some providers return empty arguments (`""`) for tools with no parameters,
+/// while legacy history and freeform tools carry bare text. Strict Chat
+/// Completions providers reject those values because function call arguments
+/// must be a JSON object string, so reuse the shared normalization that the
+/// Anthropic request builder also relies on.
+fn ensure_valid_json_arguments(name: &str, arguments: &str) -> String {
+    let trimmed = arguments.trim();
+    // Preserve valid JSON objects verbatim. Re-serializing would reorder keys
+    // (serde_json's default map is a BTreeMap) and waste a round-trip on the
+    // hot path; `trimmed` is already a valid JSON object string.
+    if matches!(
+        serde_json::from_str::<serde_json::Value>(trimmed),
+        Ok(serde_json::Value::Object(_))
+    ) {
+        return trimmed.to_string();
+    }
+    codex_tools::tool_arguments_to_json_object(name, trimmed).to_string()
+}
+
+/// Returns `(tool_content, optional_user_content)`:
+/// - `tool_content`: `Value::String(..)` with the text portion for the tool message,
+///   possibly empty. The Chat Completions API requires `content` on `role: "tool"`
+///   messages (strict providers reject missing/null content with errors such as
+///   "`content` must be provided for role `tool`" or "The content field is a
+///   required field"), so empty tool results keep an empty string instead of
+///   omitting the field.
+/// - `optional_user_content`: `Some(Value::Array(..))` with multipart content including
+///   images when the body contains `InputImage` items, otherwise `None`.
+fn split_tool_output_into_tool_and_user_content(
+    body: &codex_protocol::models::FunctionCallOutputBody,
+) -> (serde_json::Value, Option<serde_json::Value>) {
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputContentItem;
+
+    match body {
+        FunctionCallOutputBody::Text(text) => (serde_json::Value::String(text.clone()), None),
+        FunctionCallOutputBody::ContentItems(items) => {
+            if items.is_empty() {
+                return (serde_json::Value::String(String::new()), None);
+            }
+
+            let mut text_parts: Vec<String> = Vec::new();
+            let mut image_parts: Vec<serde_json::Value> = Vec::new();
+
+            for item in items {
+                match item {
+                    FunctionCallOutputContentItem::InputText { text } => {
+                        text_parts.push(text.clone());
+                    }
+                    FunctionCallOutputContentItem::InputImage { image, detail } => {
+                        let codex_protocol::models::ImageReference::Inline { image_url } = image
+                        else {
+                            // File references cannot be represented as Chat Completions
+                            // image URLs; drop them rather than erroring.
+                            continue;
+                        };
+                        let mut image_url_obj = serde_json::json!({"url": image_url});
+                        if let Some(detail) = detail {
+                            image_url_obj["detail"] = serde_json::Value::String(
+                                chat_completions_image_detail(*detail).to_string(),
+                            );
+                        }
+                        image_parts.push(serde_json::json!({
+                            "type": "image_url",
+                            "image_url": image_url_obj,
+                        }));
+                    }
+                    FunctionCallOutputContentItem::InputAudio { .. } => {
+                        // Audio tool outputs are not supported in Chat Completions
+                        // messages; drop audio items rather than erroring.
+                        continue;
+                    }
+                    FunctionCallOutputContentItem::EncryptedContent { encrypted_content } => {
+                        text_parts.push(encrypted_content.clone());
+                    }
+                }
+            }
+
+            let tool_content = if text_parts.is_empty() {
+                // If there are only images, the tool message still needs some
+                // content (some providers reject null tool content).
+                serde_json::Value::String("[image result]".to_string())
+            } else {
+                serde_json::Value::String(text_parts.join("\n"))
+            };
+
+            let user_content = if image_parts.is_empty() {
+                None
+            } else {
+                // Build multipart user message: a text label + all image parts
+                let mut parts: Vec<serde_json::Value> = Vec::new();
+                for img_part in image_parts {
+                    parts.push(img_part);
+                }
+                Some(serde_json::Value::Array(parts))
+            };
+
+            (tool_content, user_content)
+        }
+    }
+}
+
+/// Flushes accumulated tool-result image parts into a single `role: "user"`
+/// multipart message.
+///
+/// Strict Chat Completions providers require every assistant tool call to be
+/// followed directly by the corresponding `role: "tool"` message. Tool results
+/// that contain images are therefore queued until all tool results in the
+/// current assistant turn have been emitted, then materialized as one user
+/// message to avoid inserting a user message between consecutive tool results.
+fn flush_pending_tool_images(
+    messages: &mut Vec<ChatMessage>,
+    image_parts: &mut Vec<serde_json::Value>,
+) {
+    if image_parts.is_empty() {
+        return;
+    }
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: Some(serde_json::Value::Array(std::mem::take(image_parts))),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
+/// Builds a map from flat tool name to namespace prefix for MCP tools.
+/// When the Chat Completions API returns a tool call with a flat name like
+/// `ast_grep_search`, this map lets us look up the namespace (e.g. `omx_code_intel__`)
+/// so the resulting `ResponseItem::FunctionCall` carries the correct namespace
+/// for tool resolution.
+fn build_tool_namespace_map(tools: &[ToolSpec]) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for tool in tools {
+        if let ToolSpec::Namespace(ns) = tool {
+            for ns_tool in &ns.tools {
+                let ResponsesApiNamespaceTool::Function(func) = ns_tool else {
+                    continue;
+                };
+                map.insert(func.name.clone(), ns.name.clone());
+            }
+        }
+    }
+    map
+}
+
+/// Mirrors OpenCode's Chat Completions prompt cache key normalization.
+///
+/// OpenCode session IDs are `ses_` followed by 64 lowercase hex characters.
+/// OpenAI's `prompt_cache_key` is limited to 64 characters, so OpenCode strips
+/// the `ses_` prefix for those IDs and otherwise keeps the session ID unchanged.
+/// Codex session IDs are UUIDs, so this is a no-op today, but the same contract
+/// keeps Codex aligned with OpenCode-flavoured gateways.
+fn chat_completions_prompt_cache_key(session_id: &str) -> String {
+    let Some(hex) = session_id.strip_prefix("ses_") else {
+        return session_id.to_owned();
+    };
+    let is_opencode_session_id = hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if is_opencode_session_id {
+        hex.to_owned()
+    } else {
+        session_id.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod chat_completions_request_tests {
+    use super::ModelClient;
+    use super::ModelClientSession;
+    use super::chat_completions_prompt_cache_key;
+    use crate::client_common::Prompt;
+    use crate::tools::handlers::shell_spec::CommandToolOptions;
+    use crate::tools::handlers::shell_spec::create_exec_command_tool;
+    use codex_api::ChatCompletionsRequest;
+    use codex_model_provider_info::WireApi;
+    use codex_model_provider_info::create_oss_provider_with_base_url;
+    use codex_protocol::ResponseItemId;
+    use codex_protocol::ThreadId;
+    use codex_protocol::models::AgentMessageInputContent;
+    use codex_protocol::models::BaseInstructions;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_protocol::models::ImageDetail;
+    use codex_protocol::models::ReasoningItemContent;
+    use codex_protocol::models::ReasoningItemReasoningSummary;
+    use codex_protocol::models::ResponseItem;
+    use codex_protocol::openai_models::ModelInfo;
+    use codex_protocol::protocol::SessionSource;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    use codex_http_client::HttpClientFactory;
+    use codex_http_client::OutboundProxyPolicy;
+    use codex_login::auth::AgentIdentityAuthPolicy;
+
+    fn test_model_client() -> ModelClient {
+        test_model_client_with_session_source(SessionSource::Cli)
+    }
+
+    fn test_model_client_with_session_source(session_source: SessionSource) -> ModelClient {
+        let provider =
+            create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses);
+        ModelClient::new(
+            /*auth_manager*/ None,
+            /*agent_identity_policy*/ AgentIdentityAuthPolicy::JwtOnly,
+            ThreadId::new(),
+            provider,
+            session_source,
+            /*originator*/ "test_originator".to_string(),
+            /*model_verbosity*/ None,
+            /*content_item_kinds_enabled*/ false,
+            /*reasoning_effort_override_enabled*/ false,
+            /*enable_request_compression*/ false,
+            /*include_timing_metrics*/ false,
+            /*beta_features_header*/ None,
+            /*concurrent_reasoning_summaries_enabled*/ false,
+            /*attestation_provider*/ None,
+            /*http_client_factory*/
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            codex_model_provider::WorkspaceRoutingContext::new(
+                "https://chatgpt.com/backend-api".into(),
+            ),
+            /*request_contributors*/ Vec::new(),
+        )
+    }
+
+    fn test_model_info() -> ModelInfo {
+        serde_json::from_value(json!({
+            "slug": "gpt-test",
+            "display_name": "gpt-test",
+            "description": "desc",
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [
+                {"effort": "medium", "description": "medium"}
+            ],
+            "shell_type": "shell_command",
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 1,
+            "upgrade": null,
+            "base_instructions": "base instructions",
+            "model_messages": null,
+            "supports_reasoning_summary_parameter": false,
+            "support_verbosity": false,
+            "default_verbosity": null,
+            "apply_patch_tool_type": null,
+            "truncation_policy": {"mode": "bytes", "limit": 10000},
+            "supports_parallel_tool_calls": false,
+            "supports_image_detail_original": false,
+            "context_window": 272000,
+            "auto_compact_token_limit": null,
+            "experimental_supported_tools": []
+        }))
+        .expect("deserialize test model info")
+    }
+
+    fn test_prompt(input: Vec<ResponseItem>) -> Prompt {
+        Prompt {
+            input,
+            cyber_access_program: None,
+            tools: vec![create_exec_command_tool(CommandToolOptions {
+                allow_login_shell: false,
+                exec_permission_approvals_enabled: false,
+            })]
+            .into(),
+            parallel_tool_calls: false,
+            base_instructions: BaseInstructions {
+                text: String::new(),
+                provenance: None,
+            },
+            output_schema: None,
+            output_schema_strict: true,
+        }
+    }
+
+    fn build_request(input: Vec<ResponseItem>) -> ChatCompletionsRequest {
+        test_model_session()
+            .build_chat_completions_request(
+                &test_prompt(input),
+                &test_model_info(),
+                None,
+                "test-session",
+            )
+            .expect("build chat completions request")
+    }
+
+    fn build_request_with_session_source(
+        session_source: SessionSource,
+        input: Vec<ResponseItem>,
+    ) -> ChatCompletionsRequest {
+        test_model_client_with_session_source(session_source)
+            .new_session()
+            .build_chat_completions_request(
+                &test_prompt(input),
+                &test_model_info(),
+                None,
+                "test-session",
+            )
+            .expect("build chat completions request")
+    }
+
+    #[test]
+    fn chat_completions_prompt_cache_key_matches_opencode_normalization() {
+        let opencode_session = format!("ses_{}", "a".repeat(64));
+        assert_eq!(
+            chat_completions_prompt_cache_key(&opencode_session),
+            "a".repeat(64)
+        );
+
+        let already_bounded_session =
+            "ses_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            chat_completions_prompt_cache_key(already_bounded_session),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+
+        // Uppercase hex does not match OpenCode's `[0-9a-f]{64}` shape.
+        let uppercase_session = format!("ses_{}", "A".repeat(64));
+        assert_eq!(
+            chat_completions_prompt_cache_key(&uppercase_session),
+            uppercase_session
+        );
+
+        let too_short_session = format!("ses_{}", "a".repeat(63));
+        assert_eq!(
+            chat_completions_prompt_cache_key(&too_short_session),
+            too_short_session
+        );
+
+        let uuid_session = "019cf82b-6a62-7700-bbbd-46909794ef89";
+        assert_eq!(
+            chat_completions_prompt_cache_key(uuid_session),
+            uuid_session.to_owned()
+        );
+    }
+
+    fn test_model_session() -> ModelClientSession {
+        test_model_client().new_session()
+    }
+
+    fn warning_item(message: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: message.to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn assistant_message(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: text.to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn reasoning_item(text: &str) -> ResponseItem {
+        ResponseItem::Reasoning {
+            id: Some(ResponseItemId::from_server("reasoning-id".to_string())),
+            summary: vec![ReasoningItemReasoningSummary::SummaryText {
+                text: text.to_string(),
+            }],
+            content: Some(vec![ReasoningItemContent::ReasoningText {
+                text: text.to_string(),
+            }]),
+            encrypted_content: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn function_call(call_id: &str, arguments: &str) -> ResponseItem {
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "exec_command".to_string(),
+            namespace: None,
+            arguments: arguments.to_string(),
+            encrypted_function_args: None,
+            call_id: call_id.to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn function_call_named(call_id: &str, name: &str, arguments: &str) -> ResponseItem {
+        ResponseItem::FunctionCall {
+            id: None,
+            name: name.to_string(),
+            namespace: None,
+            arguments: arguments.to_string(),
+            encrypted_function_args: None,
+            call_id: call_id.to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn function_call_output(call_id: &str, output: &str) -> ResponseItem {
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some(call_id.to_string()),
+            name: None,
+            namespace: None,
+            output: FunctionCallOutputPayload::from_text(output.to_string()),
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn agent_message(
+        author: &str,
+        recipient: &str,
+        content: Vec<AgentMessageInputContent>,
+    ) -> ResponseItem {
+        ResponseItem::AgentMessage {
+            id: None,
+            author: author.to_string(),
+            recipient: recipient.to_string(),
+            content,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn subagent_session_source(agent_path: &str) -> SessionSource {
+        SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_path: Some(agent_path.parse().expect("valid agent path")),
+            agent_nickname: None,
+            agent_role: None,
+        })
+    }
+
+    fn custom_tool_call(call_id: &str, input: &str) -> ResponseItem {
+        ResponseItem::CustomToolCall {
+            id: None,
+            status: None,
+            call_id: call_id.to_string(),
+            name: "exec_command".to_string(),
+            namespace: None,
+            input: input.to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn custom_tool_call_output(call_id: &str, output: &str) -> ResponseItem {
+        ResponseItem::CustomToolCallOutput {
+            id: None,
+            call_id: call_id.to_string(),
+            name: None,
+            output: FunctionCallOutputPayload::from_text(output.to_string()),
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn function_call_output_with_image(call_id: &str, text: &str, image_url: &str) -> ResponseItem {
+        use codex_protocol::models::FunctionCallOutputContentItem;
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some(call_id.to_string()),
+            name: None,
+            namespace: None,
+            output: FunctionCallOutputPayload::from_content_items(vec![
+                FunctionCallOutputContentItem::InputText {
+                    text: text.to_string(),
+                },
+                FunctionCallOutputContentItem::InputImage {
+                    image: codex_protocol::models::ImageReference::Inline {
+                        image_url: image_url.to_string(),
+                    },
+                    detail: Some(ImageDetail::Original),
+                },
+            ]),
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    #[test]
+    fn chat_completions_request_moves_tool_warning_after_matching_tool_result() {
+        let request = build_request(vec![
+            function_call("call-1", r#"{"cmd":"pwd"}"#),
+            warning_item(
+                "Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead of exec_command.",
+            ),
+            function_call_output("call-1", "ok"),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"pwd\"}"
+                            }
+                        }
+                    ],
+                    "reasoning_content": "No reasoning required"
+                },
+                {
+                    "role": "tool",
+                    "content": "ok",
+                    "tool_call_id": "call-1"
+                },
+                {
+                    "role": "user",
+                    "content": "Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead of exec_command."
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_keeps_warning_with_later_tool_result() {
+        let request = build_request(vec![
+            function_call("call-1", r#"{"cmd":"pwd"}"#),
+            function_call_output("call-1", "first"),
+            function_call("call-2", r#"{"cmd":"ls"}"#),
+            warning_item("Warning: tool pressure warning"),
+            function_call_output("call-2", "second"),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"pwd\"}"
+                            }
+                        }
+                    ],
+                    "reasoning_content": "No reasoning required"
+                },
+                {
+                    "role": "tool",
+                    "content": "first",
+                    "tool_call_id": "call-1"
+                },
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-2",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"ls\"}"
+                            }
+                        }
+                    ],
+                    "reasoning_content": "No reasoning required"
+                },
+                {
+                    "role": "tool",
+                    "content": "second",
+                    "tool_call_id": "call-2"
+                },
+                {
+                    "role": "user",
+                    "content": "Warning: tool pressure warning"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_delivers_encrypted_agent_message_payload() {
+        // Subagent's view: the parent's task arrives as an AgentMessage whose
+        // payload lives in `encrypted_content` (see
+        // InterAgentCommunication::new_encrypted). The chat-completions
+        // request must carry the envelope and payload as plain text.
+        let request = build_request_with_session_source(
+            subagent_session_source("/root/probe"),
+            vec![agent_message(
+                "/root",
+                "/root/probe",
+                vec![
+                    AgentMessageInputContent::InputText {
+                        text: "Message Type: NEW_TASK\nTask name: /root/probe\nSender: /root\nPayload:\n"
+                            .to_string(),
+                    },
+                    AgentMessageInputContent::EncryptedContent {
+                        encrypted_content: "echo ZEBRA-7Q4K-1983".to_string(),
+                    },
+                ],
+            )],
+        );
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "user",
+                    "content": "Message Type: NEW_TASK\nTask name: /root/probe\nSender: /root\nPayload:\necho ZEBRA-7Q4K-1983"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_delivers_plaintext_agent_message() {
+        let request = build_request(vec![agent_message(
+            "/root/worker",
+            "/root",
+            vec![AgentMessageInputContent::InputText {
+                text: "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\ndone"
+                    .to_string(),
+            }],
+        )]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "user",
+                    "content": "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\ndone"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_marks_self_authored_agent_message_as_assistant() {
+        let request = build_request(vec![agent_message(
+            "/root",
+            "/root/worker",
+            vec![AgentMessageInputContent::InputText {
+                text: "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\nreview the diff"
+                    .to_string(),
+            }],
+        )]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "assistant",
+                    "content": "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\nreview the diff",
+                    "reasoning_content": "No reasoning required"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_flushes_pending_assistant_before_agent_message() {
+        let request = build_request(vec![
+            function_call("call-1", r#"{"cmd":"pwd"}"#),
+            agent_message(
+                "/root/worker",
+                "/root",
+                vec![AgentMessageInputContent::InputText {
+                    text: "Message Type: MESSAGE\nTask name: /root\nSender: /root/worker\nPayload:\nping"
+                        .to_string(),
+                }],
+            ),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"pwd\"}"
+                            }
+                        }
+                    ],
+                    "reasoning_content": "No reasoning required"
+                },
+                {
+                    "role": "user",
+                    "content": "Message Type: MESSAGE\nTask name: /root\nSender: /root/worker\nPayload:\nping"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_skips_empty_agent_message_without_flushing_warnings() {
+        let request = build_request(vec![
+            function_call("call-1", r#"{"cmd":"pwd"}"#),
+            warning_item("Warning: keep this with the tool turn"),
+            agent_message("/root/worker", "/root", Vec::new()),
+            function_call_output("call-1", "ok"),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"pwd\"}"
+                            }
+                        }
+                    ],
+                    "reasoning_content": "No reasoning required"
+                },
+                {
+                    "role": "tool",
+                    "content": "ok",
+                    "tool_call_id": "call-1"
+                },
+                {
+                    "role": "user",
+                    "content": "Warning: keep this with the tool turn"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_flushes_warnings_after_last_tool_result_in_turn() {
+        let request = build_request(vec![
+            function_call("call-1", r#"{"cmd":"pwd"}"#),
+            function_call("call-2", r#"{"cmd":"ls"}"#),
+            warning_item("Warning: first tool warning"),
+            function_call_output("call-1", "first"),
+            warning_item("Warning: second tool warning"),
+            function_call_output("call-2", "second"),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"pwd\"}"
+                            }
+                        },
+                        {
+                            "id": "call-2",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"ls\"}"
+                            }
+                        }
+                    ],
+                    "reasoning_content": "No reasoning required"
+                },
+                {
+                    "role": "tool",
+                    "content": "first",
+                    "tool_call_id": "call-1"
+                },
+                {
+                    "role": "tool",
+                    "content": "second",
+                    "tool_call_id": "call-2"
+                },
+                {
+                    "role": "user",
+                    "content": "Warning: first tool warning"
+                },
+                {
+                    "role": "user",
+                    "content": "Warning: second tool warning"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_flushes_custom_tool_warnings_after_last_tool_result_in_turn() {
+        let request = build_request(vec![
+            custom_tool_call("call-1", "pwd"),
+            custom_tool_call("call-2", "ls"),
+            warning_item("Warning: custom tool warning"),
+            custom_tool_call_output("call-1", "first"),
+            custom_tool_call_output("call-2", "second"),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"pwd\"}"
+                            }
+                        },
+                        {
+                            "id": "call-2",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"ls\"}"
+                            }
+                        }
+                    ],
+                    "reasoning_content": "No reasoning required"
+                },
+                {
+                    "role": "tool",
+                    "content": "first",
+                    "tool_call_id": "call-1"
+                },
+                {
+                    "role": "tool",
+                    "content": "second",
+                    "tool_call_id": "call-2"
+                },
+                {
+                    "role": "user",
+                    "content": "Warning: custom tool warning"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_flushes_mixed_tool_warnings_after_last_tool_result_in_turn() {
+        let request = build_request(vec![
+            function_call("call-1", r#"{"cmd":"pwd"}"#),
+            custom_tool_call("call-2", "ls"),
+            warning_item("Warning: mixed tool warning"),
+            function_call_output("call-1", "first"),
+            custom_tool_call_output("call-2", "second"),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"pwd\"}"
+                            }
+                        },
+                        {
+                            "id": "call-2",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"ls\"}"
+                            }
+                        }
+                    ],
+                    "reasoning_content": "No reasoning required"
+                },
+                {
+                    "role": "tool",
+                    "content": "first",
+                    "tool_call_id": "call-1"
+                },
+                {
+                    "role": "tool",
+                    "content": "second",
+                    "tool_call_id": "call-2"
+                },
+                {
+                    "role": "user",
+                    "content": "Warning: mixed tool warning"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_keeps_assistant_text_before_tool_warning() {
+        let request = build_request(vec![
+            assistant_message("Running command"),
+            function_call("call-1", r#"{"cmd":"pwd"}"#),
+            warning_item("Warning: merged assistant warning"),
+            function_call_output("call-1", "ok"),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "assistant",
+                    "content": "Running command",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"pwd\"}"
+                            }
+                        }
+                    ],
+                    "reasoning_content": "No reasoning required"
+                },
+                {
+                    "role": "tool",
+                    "content": "ok",
+                    "tool_call_id": "call-1"
+                },
+                {
+                    "role": "user",
+                    "content": "Warning: merged assistant warning"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_keeps_assistant_text_after_tool_warning() {
+        let request = build_request(vec![
+            function_call("call-1", r#"{"cmd":"pwd"}"#),
+            assistant_message("Running command"),
+            warning_item("Warning: merged assistant warning"),
+            function_call_output("call-1", "ok"),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "assistant",
+                    "content": "Running command",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"pwd\"}"
+                            }
+                        }
+                    ],
+                    "reasoning_content": "No reasoning required"
+                },
+                {
+                    "role": "tool",
+                    "content": "ok",
+                    "tool_call_id": "call-1"
+                },
+                {
+                    "role": "user",
+                    "content": "Warning: merged assistant warning"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_preserves_warning_before_new_assistant_turn() {
+        let request = build_request(vec![
+            warning_item("Warning: fallback model was used"),
+            assistant_message("Fallback complete"),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "user",
+                    "content": "Warning: fallback model was used"
+                },
+                {
+                    "role": "assistant",
+                    "content": "Fallback complete",
+                    "reasoning_content": "No reasoning required"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_normalizes_tool_call_arguments_to_json_objects() {
+        let request = build_request(vec![
+            function_call("call-empty", ""),
+            function_call("call-bare", "pwd"),
+            custom_tool_call("call-string", r#""ls""#),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-empty",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{}"
+                            }
+                        },
+                        {
+                            "id": "call-bare",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"pwd\"}"
+                            }
+                        },
+                        {
+                            "id": "call-string",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"ls\"}"
+                            }
+                        }
+                    ],
+                    "reasoning_content": "No reasoning required"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_preserves_object_arguments_and_wraps_other_tools() {
+        // Multi-key object with keys in non-sorted order: must be preserved
+        // verbatim (no BTreeMap reordering, no redundant re-serialization).
+        // Non-exec/shell tool names wrap into `{"input": ...}`. Bare text is
+        // trimmed before wrapping so whitespace is not smuggled into the value.
+        let request = build_request(vec![
+            function_call("call-obj", r#"{"workdir":"/tmp","cmd":"pwd"}"#),
+            function_call_named("call-input", "summarize", "some text"),
+            function_call_named("call-num", "summarize", "42"),
+            function_call("call-ws", "  pwd  "),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-obj",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"workdir\":\"/tmp\",\"cmd\":\"pwd\"}"
+                            }
+                        },
+                        {
+                            "id": "call-input",
+                            "type": "function",
+                            "function": {
+                                "name": "summarize",
+                                "arguments": "{\"input\":\"some text\"}"
+                            }
+                        },
+                        {
+                            "id": "call-num",
+                            "type": "function",
+                            "function": {
+                                "name": "summarize",
+                                "arguments": "{\"input\":42}"
+                            }
+                        },
+                        {
+                            "id": "call-ws",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"pwd\"}"
+                            }
+                        }
+                    ],
+                    "reasoning_content": "No reasoning required"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_keeps_reasoning_between_assistant_text_and_tool_call() {
+        let request = build_request(vec![
+            assistant_message("Running command"),
+            reasoning_item("Need to call a tool"),
+            function_call("call-1", r#"{"cmd":"pwd"}"#),
+            function_call_output("call-1", "ok"),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "assistant",
+                    "content": "Running command",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"pwd\"}"
+                            }
+                        }
+                    ],
+                    "reasoning_content": "Need to call a tool"
+                },
+                {
+                    "role": "tool",
+                    "content": "ok",
+                    "tool_call_id": "call-1"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_lowers_responses_reasoning_summary() {
+        let request = build_request(vec![
+            ResponseItem::Reasoning {
+                id: Some(ResponseItemId::from_server("rs_server".to_string())),
+                summary: vec![ReasoningItemReasoningSummary::SummaryText {
+                    text: "Responses reasoning summary".to_string(),
+                }],
+                content: None,
+                encrypted_content: Some("encrypted-responses-reasoning".to_string()),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            assistant_message("Responses answer"),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "assistant",
+                    "content": "Responses answer",
+                    "reasoning_content": "Responses reasoning summary"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_user_message_with_image_uses_multipart_content() {
+        let request = build_request(vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                ContentItem::InputText {
+                    text: "Describe this image".to_string(),
+                },
+                ContentItem::InputImage {
+                    image: codex_protocol::models::ImageReference::Inline {
+                        image_url: "data:image/png;base64,abc".to_string(),
+                    },
+                    detail: Some(ImageDetail::High),
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }]);
+
+        let messages = &request.messages;
+        // System message + user message
+        assert_eq!(messages.len(), 1);
+        let user_msg = &messages[0];
+        assert_eq!(user_msg.role, "user");
+        let content = user_msg
+            .content
+            .as_ref()
+            .expect("user message should have content");
+        // Should be multipart array format
+        assert!(
+            content.is_array(),
+            "content with image should be multipart array"
+        );
+        let arr = content.as_array().expect("content should be array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], "Describe this image");
+        assert_eq!(arr[1]["type"], "image_url");
+        assert_eq!(arr[1]["image_url"]["url"], "data:image/png;base64,abc");
+        assert_eq!(arr[1]["image_url"]["detail"], "high");
+    }
+
+    #[test]
+    fn chat_completions_request_user_message_text_only_remains_string() {
+        let request = build_request(vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "hello".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }]);
+
+        let messages = &request.messages;
+        assert_eq!(messages.len(), 1);
+        let user_msg = &messages[0];
+        assert_eq!(user_msg.role, "user");
+        let content = user_msg.content.as_ref().expect("should have content");
+        // Text-only should remain as plain string
+        assert!(content.is_string(), "text-only content should be a string");
+        assert_eq!(content.as_str().unwrap(), "hello");
+    }
+
+    #[test]
+    fn chat_completions_request_assistant_message_drops_image() {
+        let request = build_request(vec![ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![
+                ContentItem::OutputText {
+                    text: "Here is the result".to_string(),
+                },
+                ContentItem::InputImage {
+                    image: codex_protocol::models::ImageReference::Inline {
+                        image_url: "data:image/png;base64,abc".to_string(),
+                    },
+                    detail: Some(ImageDetail::High),
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }]);
+
+        let messages = &request.messages;
+        let assistant_msg = &messages[0];
+        assert_eq!(assistant_msg.role, "assistant");
+        let content = assistant_msg.content.as_ref().expect("should have content");
+        // Assistant messages should be text-only (images dropped)
+        assert!(
+            content.is_string(),
+            "assistant content should be plain string"
+        );
+        assert_eq!(content.as_str().unwrap(), "Here is the result");
+    }
+
+    #[test]
+    fn chat_completions_request_user_message_image_only() {
+        let request = build_request(vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputImage {
+                image: codex_protocol::models::ImageReference::Inline {
+                    image_url: "data:image/png;base64,xyz".to_string(),
+                },
+                detail: Some(ImageDetail::High),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }]);
+
+        let messages = &request.messages;
+        let user_msg = &messages[0];
+        assert_eq!(user_msg.role, "user");
+        let content = user_msg.content.as_ref().expect("should have content");
+        assert!(
+            content.is_array(),
+            "image-only content should be multipart array"
+        );
+        let arr = content.as_array().expect("content should be array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "image_url");
+        assert_eq!(arr[0]["image_url"]["url"], "data:image/png;base64,xyz");
+        assert_eq!(arr[0]["image_url"]["detail"], "high");
+    }
+
+    #[test]
+    fn chat_completions_request_user_message_image_detail_none_omits_field() {
+        let request = build_request(vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputImage {
+                image: codex_protocol::models::ImageReference::Inline {
+                    image_url: "data:image/png;base64,test".to_string(),
+                },
+                detail: None,
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }]);
+
+        let messages = &request.messages;
+        let user_msg = &messages[0];
+        let content = user_msg.content.as_ref().expect("should have content");
+        let arr = content.as_array().expect("content should be array");
+        // When detail is None, the detail field should be omitted
+        assert_eq!(arr[0]["image_url"]["url"], "data:image/png;base64,test");
+        assert!(
+            arr[0]["image_url"].get("detail").is_none(),
+            "detail should be omitted when None"
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_user_message_multiple_images() {
+        let request = build_request(vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                ContentItem::InputText {
+                    text: "Compare these".to_string(),
+                },
+                ContentItem::InputImage {
+                    image: codex_protocol::models::ImageReference::Inline {
+                        image_url: "data:image/png;base64,aaa".to_string(),
+                    },
+                    detail: Some(ImageDetail::High),
+                },
+                ContentItem::InputImage {
+                    image: codex_protocol::models::ImageReference::Inline {
+                        image_url: "data:image/jpeg;base64,bbb".to_string(),
+                    },
+                    detail: Some(ImageDetail::Original),
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }]);
+
+        let messages = &request.messages;
+        let user_msg = &messages[0];
+        let content = user_msg.content.as_ref().expect("should have content");
+        let arr = content
+            .as_array()
+            .expect("content should be multipart array");
+        assert_eq!(arr.len(), 3);
+        // Text part
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], "Compare these");
+        // First image
+        assert_eq!(arr[1]["type"], "image_url");
+        assert_eq!(arr[1]["image_url"]["url"], "data:image/png;base64,aaa");
+        assert_eq!(arr[1]["image_url"]["detail"], "high");
+        // Second image
+        assert_eq!(arr[2]["type"], "image_url");
+        assert_eq!(arr[2]["image_url"]["url"], "data:image/jpeg;base64,bbb");
+        // `original` is not valid on the Chat Completions wire and is downgraded to `high`.
+        assert_eq!(arr[2]["image_url"]["detail"], "high");
+    }
+
+    #[test]
+    fn chat_completions_request_tool_output_with_image_splits_into_tool_and_user() {
+        let request = build_request(vec![
+            function_call("call-1", r#"{"cmd":"view_image"}"#),
+            function_call_output_with_image(
+                "call-1",
+                "Here is the image:",
+                "data:image/png;base64,abc123",
+            ),
+        ]);
+
+        let messages = &request.messages;
+        // First message: assistant with tool_calls
+        assert_eq!(messages[0].role, "assistant");
+        assert!(messages[0].tool_calls.is_some());
+        // Second message: tool with text-only content (images cannot go in tool messages)
+        assert_eq!(messages[1].role, "tool");
+        let tool_content = messages[1]
+            .content
+            .as_ref()
+            .expect("tool should have content");
+        assert!(
+            tool_content.is_string(),
+            "tool content should be plain text"
+        );
+        assert_eq!(tool_content.as_str(), Some("Here is the image:"));
+        // Third message: user with the image in multipart format
+        assert_eq!(messages[2].role, "user");
+        let user_content = messages[2]
+            .content
+            .as_ref()
+            .expect("user message should have image content");
+        assert!(
+            user_content.is_array(),
+            "user image content should be multipart array"
+        );
+        let arr = user_content.as_array().expect("content should be array");
+        assert_eq!(arr.len(), 1);
+        // Image part
+        assert_eq!(arr[0]["type"], "image_url");
+        assert_eq!(arr[0]["image_url"]["url"], "data:image/png;base64,abc123");
+        assert_eq!(arr[0]["image_url"]["detail"], "high");
+    }
+
+    #[test]
+    fn chat_completions_request_parallel_tool_outputs_defer_image_user_message() {
+        let request = build_request(vec![
+            function_call("call-1", r#"{"cmd":"view_image"}"#),
+            function_call("call-2", r#"{"cmd":"pwd"}"#),
+            function_call_output_with_image(
+                "call-1",
+                "Here is the image:",
+                "data:image/png;base64,abc123",
+            ),
+            function_call_output("call-2", "second"),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"view_image\"}"
+                            }
+                        },
+                        {
+                            "id": "call-2",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"pwd\"}"
+                            }
+                        }
+                    ],
+                    "reasoning_content": "No reasoning required"
+                },
+                {
+                    "role": "tool",
+                    "content": "Here is the image:",
+                    "tool_call_id": "call-1"
+                },
+                {
+                    "role": "tool",
+                    "content": "second",
+                    "tool_call_id": "call-2"
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/png;base64,abc123",
+                                "detail": "high"
+                            }
+                        }
+                    ]
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_empty_text_tool_output_keeps_content_field() {
+        // Regression: strict Chat Completions providers reject `role: "tool"`
+        // messages without `content` (e.g. "`content` must be provided for role
+        // `tool`" or "The content field is a required field"), so empty tool
+        // results must serialize with an empty-string content.
+        let request = build_request(vec![
+            function_call("call-1", r#"{"cmd":"true"}"#),
+            function_call_output("call-1", ""),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"true\"}"
+                            }
+                        }
+                    ],
+                    "reasoning_content": "No reasoning required"
+                },
+                {
+                    "role": "tool",
+                    "content": "",
+                    "tool_call_id": "call-1"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_empty_content_items_tool_output_keeps_content_field() {
+        let request = build_request(vec![
+            function_call("call-1", r#"{"cmd":"true"}"#),
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: Some("call-1".to_string()),
+                name: None,
+                namespace: None,
+                output: FunctionCallOutputPayload::from_content_items(Vec::new()),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(&request.messages).expect("serialize messages"),
+            json!([
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"true\"}"
+                            }
+                        }
+                    ],
+                    "reasoning_content": "No reasoning required"
+                },
+                {
+                    "role": "tool",
+                    "content": "",
+                    "tool_call_id": "call-1"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_deduplication_keeps_tool_call_id_consistent() {
+        // Regression: when consecutive identical tool calls are deduplicated,
+        // the surviving assistant message (the first one) keeps its original
+        // tool_call id, and the surviving tool result (the last one) must have
+        // its tool_call_id rewritten to match. Otherwise the API rejects the
+        // request with a 400 "tool_call_id mismatch" error.
+        let request = build_request(vec![
+            function_call("call-1", r#"{"cmd":"pwd"}"#),
+            function_call_output("call-1", "result-1"),
+            function_call("call-2", r#"{"cmd":"pwd"}"#),
+            function_call_output("call-2", "result-2"),
+            function_call("call-3", r#"{"cmd":"pwd"}"#),
+            function_call_output("call-3", "result-3"),
+        ]);
+
+        let messages = &request.messages;
+
+        // After deduplication we expect:
+        //   [0] assistant with tool_calls[0].id = "call-1" (the first call)
+        //   [1] tool result with tool_call_id = "call-1" (rewritten to match)
+        assert_eq!(
+            messages.len(),
+            2,
+            "expected 2 messages after dedup, got {messages:?}"
+        );
+
+        // The assistant message keeps the first call's id.
+        let asst = &messages[0];
+        assert_eq!(asst.role, "assistant");
+        let tool_calls = asst
+            .tool_calls
+            .as_ref()
+            .expect("assistant should have tool_calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call-1");
+
+        // The tool result's tool_call_id must match the assistant's tool_call id.
+        let tool_msg = &messages[1];
+        assert_eq!(tool_msg.role, "tool");
+        assert_eq!(
+            tool_msg.tool_call_id.as_deref(),
+            Some("call-1"),
+            "tool_call_id must be rewritten to match the surviving assistant's tool_call id"
+        );
+    }
+}
+
+/// Stamp a ResponsesWsRequest with the current time.
+///
+/// Meant to be called just before sending the request over the socket, to capture realistic
+/// transport timing.
+fn stamp_ws_stream_request_start_ms(request: &mut ResponsesWsRequest<'_>) {
+    let ResponsesWsRequest::ResponseCreate(payload) = request;
+    payload
+        .client_metadata
+        .get_or_insert_with(HashMap::new)
+        .insert(
+            X_CODEX_WS_STREAM_REQUEST_START_MS_CLIENT_METADATA_KEY.to_string(),
+            crate::turn_timing::now_unix_timestamp_ms().to_string(),
+        );
+}
+
+fn is_guardian_reviewer(responses_headers: &ApiHeaderMap) -> bool {
+    responses_headers
+        .get("x-codex-guardian")
+        .is_some_and(|value| value == "reviewer")
+}
+
+/// Builds the extra headers attached to Responses API requests.
+///
+/// These headers implement Codex-specific conventions:
+///
+/// - `x-codex-beta-features`: comma-separated beta feature keys enabled for the session.
+/// - `x-codex-turn-state`: sticky routing token captured earlier in the turn.
+fn build_responses_headers(
+    beta_features_header: Option<&str>,
+    turn_state: Option<&Arc<OnceLock<String>>>,
+) -> ApiHeaderMap {
+    let mut headers = ApiHeaderMap::new();
+    if let Some(value) = beta_features_header
+        && !value.is_empty()
+        && let Ok(header_value) = HeaderValue::from_str(value)
+    {
+        headers.insert("x-codex-beta-features", header_value);
+    }
+    if let Some(turn_state) = turn_state
+        && let Some(state) = turn_state.get()
+        && let Ok(header_value) = HeaderValue::from_str(state)
+    {
+        headers.insert(X_CODEX_TURN_STATE_HEADER, header_value);
+    }
+    headers
+}
+
+fn add_responses_lite_header(headers: &mut ApiHeaderMap, use_responses_lite: bool) {
+    if use_responses_lite {
+        headers.insert(
+            X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER,
+            HeaderValue::from_static("true"),
+        );
+    }
+}
+
+const RESPONSE_STREAM_CHANNEL_CAPACITY: usize = 1600;
+const STREAM_DROPPED_REASON: &str = "response stream dropped before provider terminal event";
+
+fn map_response_stream(
+    mut api_stream: codex_api::ResponseStream,
+    session_telemetry: SessionTelemetry,
+    inference_trace_attempt: InferenceTraceAttempt,
+    provider: SharedModelProvider,
+    interceptors: Vec<Box<dyn codex_extension_api::ModelResponseInterceptor>>,
+) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
+    let upstream_request_id = api_stream.upstream_request_id.take();
+    let interrupt = api_stream.interrupt.take();
+    let (mut stream, last_response) = map_response_events(
+        upstream_request_id,
+        crate::model_request::intercept_stream(Box::pin(api_stream), interceptors),
+        session_telemetry,
+        inference_trace_attempt,
+        provider,
+    );
+    stream.interrupt = interrupt;
+    (stream, last_response)
+}
+
+fn map_response_events<S>(
+    upstream_request_id: Option<String>,
+    api_stream: S,
+    session_telemetry: SessionTelemetry,
+    inference_trace_attempt: InferenceTraceAttempt,
+    provider: SharedModelProvider,
+) -> (ResponseStream, oneshot::Receiver<LastResponse>)
+where
+    S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
+        + Unpin
+        + Send
+        + 'static,
+{
+    let (tx_event, rx_event) =
+        mpsc::channel::<Result<ResponseEvent>>(RESPONSE_STREAM_CHANNEL_CAPACITY);
+    let (tx_last_response, rx_last_response) = oneshot::channel::<LastResponse>();
+    let consumer_dropped = CancellationToken::new();
+    let consumer_dropped_for_stream = consumer_dropped.clone();
+
+    tokio::spawn(async move {
+        let mut logged_error = false;
+        let mut tx_last_response = Some(tx_last_response);
+        let mut items_added: Vec<ResponseItem> = Vec::new();
+        let (request_start, mut ttft_ms) = (Instant::now(), None);
+        let mut api_stream = api_stream;
+        let upstream_request_id = upstream_request_id.as_deref();
+        if let Some(upstream_request_id) = upstream_request_id {
+            feedback_tags!(last_model_request_id = upstream_request_id);
+        }
+        loop {
+            let event = tokio::select! {
+                _ = consumer_dropped.cancelled() => {
+                    inference_trace_attempt.record_cancelled(
+                        STREAM_DROPPED_REASON,
+                        upstream_request_id,
+                        &items_added,
+                    );
+                    return;
+                }
+                event = api_stream.next() => event,
+            };
+            let Some(event) = event else {
+                break;
+            };
+            match event {
+                Ok(ResponseEvent::OutputItemDone(item)) => {
+                    items_added.push(item.clone());
+                    if tx_event
+                        .send(Ok(ResponseEvent::OutputItemDone(item)))
+                        .await
+                        .is_err()
+                    {
+                        inference_trace_attempt.record_cancelled(
+                            STREAM_DROPPED_REASON,
+                            upstream_request_id,
+                            &items_added,
+                        );
+                        return;
+                    }
+                }
+                Ok(ResponseEvent::Completed {
+                    response_id,
+                    token_usage,
+                    usage_metadata,
+                    end_turn,
+                }) => {
+                    feedback_tags!(last_model_response_id = &response_id);
+                    if let Some(usage) = &token_usage {
+                        session_telemetry.sse_event_completed(usage, ttft_ms);
+                    }
+                    inference_trace_attempt.record_completed(
+                        &response_id,
+                        upstream_request_id,
+                        &token_usage,
+                        &items_added,
+                    );
+                    if let Some(sender) = tx_last_response.take() {
+                        let _ = sender.send(LastResponse {
+                            response_id: response_id.clone(),
+                            items_added: std::mem::take(&mut items_added),
+                        });
+                    }
+                    if tx_event
+                        .send(Ok(ResponseEvent::Completed {
+                            response_id,
+                            token_usage,
+                            usage_metadata,
+                            end_turn,
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(event) => {
+                    if matches!(&event, ResponseEvent::OutputItemAdded(_)) && ttft_ms.is_none() {
+                        ttft_ms = Some(
+                            i64::try_from(request_start.elapsed().as_millis()).unwrap_or(i64::MAX),
+                        );
+                    }
+                    if tx_event.send(Ok(event)).await.is_err() {
+                        inference_trace_attempt.record_cancelled(
+                            STREAM_DROPPED_REASON,
+                            upstream_request_id,
+                            &items_added,
+                        );
+                        return;
+                    }
+                }
+                Err(err) => {
+                    let response_debug_context =
+                        extract_response_debug_context_from_api_error(&err);
+                    let upstream_request_id =
+                        upstream_request_id.or(response_debug_context.request_id.as_deref());
+                    if let Some(upstream_request_id) = upstream_request_id {
+                        feedback_tags!(last_model_request_id = upstream_request_id);
+                    }
+                    let mapped = provider.map_api_error(err);
+                    inference_trace_attempt.record_failed(
+                        &mapped,
+                        upstream_request_id,
+                        &items_added,
+                    );
+                    if !logged_error {
+                        session_telemetry.see_event_completed_failed(&mapped);
+                        logged_error = true;
+                    }
+                    if tx_event.send(Err(mapped)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        inference_trace_attempt.record_failed(
+            "stream closed before response.completed",
+            upstream_request_id,
+            &items_added,
+        );
+    });
+
+    (
+        ResponseStream {
+            rx_event,
+            interrupt: None,
+            consumer_dropped: consumer_dropped_for_stream,
+        },
+        rx_last_response,
+    )
+}
+
+/// Handles a 401 response by optionally refreshing ChatGPT tokens once.
+///
+/// When refresh succeeds, the caller should retry the API call; otherwise
+/// the mapped `CodexErr` is returned to the caller.
+#[derive(Clone, Copy, Debug)]
+struct UnauthorizedRecoveryExecution {
+    mode: &'static str,
+    phase: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PendingUnauthorizedRetry {
+    retry_after_unauthorized: bool,
+    recovery_mode: Option<&'static str>,
+    recovery_phase: Option<&'static str>,
+}
+
+impl PendingUnauthorizedRetry {
+    fn from_recovery(recovery: UnauthorizedRecoveryExecution) -> Self {
+        Self {
+            retry_after_unauthorized: true,
+            recovery_mode: Some(recovery.mode),
+            recovery_phase: Some(recovery.phase),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct AuthRequestTelemetryContext {
+    auth_mode: Option<&'static str>,
+    auth_header_attached: bool,
+    auth_header_name: Option<&'static str>,
+    agent_identity_telemetry: Option<AgentIdentityTelemetry>,
+    retry_after_unauthorized: bool,
+    recovery_mode: Option<&'static str>,
+    recovery_phase: Option<&'static str>,
+}
+
+impl AuthRequestTelemetryContext {
+    fn new(
+        auth_mode: Option<AuthMode>,
+        api_auth: &dyn AuthProvider,
+        agent_identity_telemetry: Option<AgentIdentityTelemetry>,
+        retry: PendingUnauthorizedRetry,
+    ) -> Self {
+        let auth_telemetry = auth_header_telemetry(api_auth);
+        Self {
+            auth_mode: auth_mode.map(|mode| match mode {
+                AuthMode::ApiKey | AuthMode::BedrockApiKey | AuthMode::BedrockAccessKeys => {
+                    "ApiKey"
+                }
+                AuthMode::Chatgpt
+                | AuthMode::ChatgptAuthTokens
+                | AuthMode::Headers
+                | AuthMode::AgentIdentity
+                | AuthMode::PersonalAccessToken => "Chatgpt",
+            }),
+            auth_header_attached: auth_telemetry.attached,
+            auth_header_name: auth_telemetry.name,
+            agent_identity_telemetry,
+            retry_after_unauthorized: retry.retry_after_unauthorized,
+            recovery_mode: retry.recovery_mode,
+            recovery_phase: retry.recovery_phase,
+        }
+    }
+
+    fn agent_identity_telemetry(&self) -> Option<&AgentIdentityTelemetry> {
+        self.agent_identity_telemetry.as_ref()
+    }
+}
+
+struct WebsocketConnectParams<'a> {
+    session_telemetry: &'a SessionTelemetry,
+    api_provider: codex_api::Provider,
+    auth_revision: Option<u64>,
+    api_auth: SharedAuthProvider,
+    auth_owner_generation: Option<u64>,
+    responses_metadata: &'a CodexResponsesMetadata,
+    auth_context: AuthRequestTelemetryContext,
+    request_route_telemetry: RequestRouteTelemetry,
+    responses_headers: &'a ApiHeaderMap,
+}
+
+fn emit_auth_recovery_event(
+    event_sender: Option<&Sender<ProtocolEvent>>,
+    turn_id: Option<&str>,
+    provider: &SharedModelProvider,
+    message: &str,
+    event: fn(AuthRecoveryEvent) -> EventMsg,
+) {
+    if let (Some(sender), Some(turn_id)) = (event_sender, turn_id) {
+        let _ = sender.try_send(ProtocolEvent {
+            id: turn_id.to_string(),
+            msg: event(AuthRecoveryEvent {
+                provider: provider.info().name.clone(),
+                message: message.to_string(),
+            }),
+        });
+    }
+}
+
+async fn handle_unauthorized(
+    transport: TransportError,
+    auth_recovery: &mut Option<UnauthorizedRecovery>,
+    provider_auth_recovery_attempted: &mut bool,
+    session_telemetry: &SessionTelemetry,
+    provider: &SharedModelProvider,
+    event_sender: Option<&Sender<ProtocolEvent>>,
+    turn_id: Option<&str>,
+) -> Result<UnauthorizedRecoveryExecution> {
+    let debug = extract_response_debug_context(&transport);
+    if !*provider_auth_recovery_attempted {
+        *provider_auth_recovery_attempted = true;
+        let messages = provider.auth_recovery_messages();
+        if let Some(messages) = messages {
+            emit_auth_recovery_event(
+                event_sender,
+                turn_id,
+                provider,
+                messages.started,
+                EventMsg::AuthRecoveryStarted,
+            );
+        }
+        match provider.recover_from_unauthorized().await {
+            Ok(ProviderUnauthorizedRecovery::Recovered) => {
+                if let Some(messages) = messages {
+                    emit_auth_recovery_event(
+                        event_sender,
+                        turn_id,
+                        provider,
+                        messages.succeeded,
+                        EventMsg::AuthRecoveryCompleted,
+                    );
+                }
+                return Ok(UnauthorizedRecoveryExecution {
+                    mode: "provider",
+                    phase: "provider_refresh",
+                });
+            }
+            Ok(ProviderUnauthorizedRecovery::NotConfigured) => {}
+            Err(error) => {
+                let original = provider.map_api_error(ApiError::Transport(transport));
+                warn!(
+                    error = %error,
+                    original_error = %original,
+                    "provider authentication recovery failed"
+                );
+                return Err(if error.retry_delay(/*retry_count*/ 1).is_some() {
+                    original
+                } else {
+                    error
+                });
+            }
+        }
+    }
+
+    if let Some(recovery) = auth_recovery
+        && recovery.has_next()
+    {
+        let mode = recovery.mode_name();
+        let phase = recovery.step_name();
+        return match recovery.next().await {
+            Ok(step_result) => {
+                session_telemetry.record_auth_recovery(
+                    mode,
+                    phase,
+                    "recovery_succeeded",
+                    debug.request_id.as_deref(),
+                    debug.cf_ray.as_deref(),
+                    debug.auth_error.as_deref(),
+                    debug.auth_error_code.as_deref(),
+                    /*recovery_reason*/ None,
+                    step_result.auth_state_changed(),
+                );
+                emit_feedback_auth_recovery_tags(
+                    mode,
+                    phase,
+                    "recovery_succeeded",
+                    debug.request_id.as_deref(),
+                    debug.cf_ray.as_deref(),
+                    debug.auth_error.as_deref(),
+                    debug.auth_error_code.as_deref(),
+                );
+                Ok(UnauthorizedRecoveryExecution { mode, phase })
+            }
+            Err(RefreshTokenError::Policy(error)) => Err(CodexErr::Fatal(error.to_string())),
+            Err(RefreshTokenError::Permanent(failed)) => {
+                session_telemetry.record_auth_recovery(
+                    mode,
+                    phase,
+                    "recovery_failed_permanent",
+                    debug.request_id.as_deref(),
+                    debug.cf_ray.as_deref(),
+                    debug.auth_error.as_deref(),
+                    debug.auth_error_code.as_deref(),
+                    /*recovery_reason*/ None,
+                    /*auth_state_changed*/ None,
+                );
+                emit_feedback_auth_recovery_tags(
+                    mode,
+                    phase,
+                    "recovery_failed_permanent",
+                    debug.request_id.as_deref(),
+                    debug.cf_ray.as_deref(),
+                    debug.auth_error.as_deref(),
+                    debug.auth_error_code.as_deref(),
+                );
+                Err(CodexErr::RefreshTokenFailed(failed))
+            }
+            Err(RefreshTokenError::Transient(other)) => {
+                session_telemetry.record_auth_recovery(
+                    mode,
+                    phase,
+                    "recovery_failed_transient",
+                    debug.request_id.as_deref(),
+                    debug.cf_ray.as_deref(),
+                    debug.auth_error.as_deref(),
+                    debug.auth_error_code.as_deref(),
+                    /*recovery_reason*/ None,
+                    /*auth_state_changed*/ None,
+                );
+                emit_feedback_auth_recovery_tags(
+                    mode,
+                    phase,
+                    "recovery_failed_transient",
+                    debug.request_id.as_deref(),
+                    debug.cf_ray.as_deref(),
+                    debug.auth_error.as_deref(),
+                    debug.auth_error_code.as_deref(),
+                );
+                Err(CodexErr::Io(other))
+            }
+        };
+    }
+
+    let (mode, phase, recovery_reason) = match auth_recovery.as_ref() {
+        Some(recovery) => (
+            recovery.mode_name(),
+            recovery.step_name(),
+            Some(recovery.unavailable_reason()),
+        ),
+        None => ("none", "none", Some("auth_manager_missing")),
+    };
+    session_telemetry.record_auth_recovery(
+        mode,
+        phase,
+        "recovery_not_run",
+        debug.request_id.as_deref(),
+        debug.cf_ray.as_deref(),
+        debug.auth_error.as_deref(),
+        debug.auth_error_code.as_deref(),
+        recovery_reason,
+        /*auth_state_changed*/ None,
+    );
+    emit_feedback_auth_recovery_tags(
+        mode,
+        phase,
+        "recovery_not_run",
+        debug.request_id.as_deref(),
+        debug.cf_ray.as_deref(),
+        debug.auth_error.as_deref(),
+        debug.auth_error_code.as_deref(),
+    );
+
+    Err(provider.map_api_error(ApiError::Transport(transport)))
+}
+
+fn api_error_http_status(error: &ApiError) -> Option<u16> {
+    match error {
+        ApiError::Transport(TransportError::Http { status, .. }) => Some(status.as_u16()),
+        ApiError::Api { status, .. } => Some(status.as_u16()),
+        _ => None,
+    }
+}
+
+struct ApiTelemetry {
+    session_telemetry: SessionTelemetry,
+    auth_context: AuthRequestTelemetryContext,
+    request_route_telemetry: RequestRouteTelemetry,
+    auth_env_telemetry: AuthEnvTelemetry,
+}
+
+impl ApiTelemetry {
+    fn new(
+        session_telemetry: SessionTelemetry,
+        auth_context: AuthRequestTelemetryContext,
+        request_route_telemetry: RequestRouteTelemetry,
+        auth_env_telemetry: AuthEnvTelemetry,
+    ) -> Self {
+        Self {
+            session_telemetry,
+            auth_context,
+            request_route_telemetry,
+            auth_env_telemetry,
+        }
+    }
+}
+
+impl RequestTelemetry for ApiTelemetry {
+    fn on_request(
+        &self,
+        attempt: u64,
+        status: Option<StatusCode>,
+        error: Option<&TransportError>,
+        duration: Duration,
+    ) {
+        let error_message = error.map(telemetry_transport_error_message);
+        let status = status.map(|s| s.as_u16());
+        let debug = error
+            .map(extract_response_debug_context)
+            .unwrap_or_default();
+        self.session_telemetry.record_api_request(
+            attempt,
+            status,
+            error_message.as_deref(),
+            duration,
+            self.auth_context.auth_header_attached,
+            self.auth_context.auth_header_name,
+            self.auth_context.retry_after_unauthorized,
+            self.auth_context.recovery_mode,
+            self.auth_context.recovery_phase,
+            self.request_route_telemetry.endpoint,
+            debug.request_id.as_deref(),
+            debug.cf_ray.as_deref(),
+            debug.auth_error.as_deref(),
+            debug.auth_error_code.as_deref(),
+            self.auth_context.agent_identity_telemetry(),
+        );
+        emit_feedback_request_tags_with_auth_env(
+            &FeedbackRequestTags {
+                endpoint: self.request_route_telemetry.endpoint,
+                auth_header_attached: self.auth_context.auth_header_attached,
+                auth_header_name: self.auth_context.auth_header_name,
+                auth_mode: self.auth_context.auth_mode,
+                auth_retry_after_unauthorized: Some(self.auth_context.retry_after_unauthorized),
+                auth_recovery_mode: self.auth_context.recovery_mode,
+                auth_recovery_phase: self.auth_context.recovery_phase,
+                auth_connection_reused: None,
+                auth_request_id: debug.request_id.as_deref(),
+                auth_cf_ray: debug.cf_ray.as_deref(),
+                auth_error: debug.auth_error.as_deref(),
+                auth_error_code: debug.auth_error_code.as_deref(),
+                auth_recovery_followup_success: self
+                    .auth_context
+                    .retry_after_unauthorized
+                    .then_some(error.is_none()),
+                auth_recovery_followup_status: self
+                    .auth_context
+                    .retry_after_unauthorized
+                    .then_some(status)
+                    .flatten(),
+            },
+            &self.auth_env_telemetry,
+        );
+    }
+}
+
+impl SseTelemetry for ApiTelemetry {
+    fn on_sse_poll(
+        &self,
+        result: &std::result::Result<
+            Option<std::result::Result<Event, EventStreamError<TransportError>>>,
+            tokio::time::error::Elapsed,
+        >,
+        duration: Duration,
+    ) {
+        self.session_telemetry.log_sse_event(result, duration);
+    }
+}
+
+impl WebsocketTelemetry for ApiTelemetry {
+    fn on_ws_request(&self, duration: Duration, error: Option<&ApiError>, connection_reused: bool) {
+        let error_message = error.map(telemetry_api_error_message);
+        let status = error.and_then(api_error_http_status);
+        let debug = error
+            .map(extract_response_debug_context_from_api_error)
+            .unwrap_or_default();
+        self.session_telemetry.record_websocket_request(
+            duration,
+            error_message.as_deref(),
+            connection_reused,
+            self.auth_context.agent_identity_telemetry(),
+        );
+        emit_feedback_request_tags_with_auth_env(
+            &FeedbackRequestTags {
+                endpoint: self.request_route_telemetry.endpoint,
+                auth_header_attached: self.auth_context.auth_header_attached,
+                auth_header_name: self.auth_context.auth_header_name,
+                auth_mode: self.auth_context.auth_mode,
+                auth_retry_after_unauthorized: Some(self.auth_context.retry_after_unauthorized),
+                auth_recovery_mode: self.auth_context.recovery_mode,
+                auth_recovery_phase: self.auth_context.recovery_phase,
+                auth_connection_reused: Some(connection_reused),
+                auth_request_id: debug.request_id.as_deref(),
+                auth_cf_ray: debug.cf_ray.as_deref(),
+                auth_error: debug.auth_error.as_deref(),
+                auth_error_code: debug.auth_error_code.as_deref(),
+                auth_recovery_followup_success: self
+                    .auth_context
+                    .retry_after_unauthorized
+                    .then_some(error.is_none()),
+                auth_recovery_followup_status: self
+                    .auth_context
+                    .retry_after_unauthorized
+                    .then_some(status)
+                    .flatten(),
+            },
+            &self.auth_env_telemetry,
+        );
+    }
+
+    fn on_ws_event(
+        &self,
+        result: &std::result::Result<Option<std::result::Result<Message, Error>>, ApiError>,
+        duration: Duration,
+    ) {
+        self.session_telemetry
+            .record_websocket_event(result, duration);
+    }
+}
+
+#[cfg(test)]
+#[path = "client_tests.rs"]
+mod tests;
